@@ -25,7 +25,7 @@ ln -sfn "$PWD/android/app/jni/SDL2/include" /tmp/opencode/sdlink_inc/SDL2 2>/dev
 bad=0
 for f in runtime/*.cpp; do
     o=/tmp/opencode/linkchk/$(basename "$f" .cpp).o
-    clang++ -DGAME_USM -std=c++17 -O1 -fno-strict-aliasing -Iruntime -Igen \
+    clang++ -DGAME_FC2 -std=c++17 -O1 -fno-strict-aliasing -Iruntime -Igen \
         -Iandroid/app/jni/dxvk/include/native/directx \
         -Iandroid/app/jni/dxvk/include/native/windows -DDXVK_NATIVE \
         -I/tmp/opencode/sdlink_inc -Wno-everything -c "$f" -o "$o"

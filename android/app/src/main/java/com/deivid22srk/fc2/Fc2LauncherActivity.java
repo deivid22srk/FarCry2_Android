@@ -87,6 +87,7 @@ public class Fc2LauncherActivity extends Activity {
     private SharedPreferences prefs;
     private TextView folderText, folderStatus, buildStatus, statusLine;
     private View playButton;
+    private LinearLayout driverList;           /* the GPU-driver rows, rebuilt on demand */
     private FrameLayout homeScreen, settingsScreen;
     private final Map<String, CompoundButton> toggles = new LinkedHashMap<>();
     private final TextView[] logChips = new TextView[3];
