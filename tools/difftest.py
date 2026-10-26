@@ -15,7 +15,11 @@ import sys
 
 EXE, FUNCS, WORK = sys.argv[1:4]
 PER_SHAPE = int(sys.argv[4]) if len(sys.argv) > 4 else 3
-sys.argv = [sys.argv[0], EXE, FUNCS, WORK]
+# Optional 5th argument: the base the module was lifted at (matches
+# lift.py's NEW_BASE), for modules that were rebased out of their preferred
+# load address (e.g. systemdetection.dll -> 0x12000000).
+NEW_BASE = sys.argv[5] if len(sys.argv) > 5 else None
+sys.argv = [sys.argv[0], EXE, FUNCS, WORK, "difftest"] + ([NEW_BASE] if NEW_BASE else [])
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lift  # noqa: E402
 from capstone import x86  # noqa: E402

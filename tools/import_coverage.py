@@ -115,7 +115,13 @@ def report(exe, impl, traps, exports):
     for e in p.DIRECTORY_ENTRY_IMPORT:
         dll = base(e.dll.decode().lower())
         for imp in e.imports:
-            name = imp.name.decode() if imp.name else "#%d" % imp.ordinal
+            # pefile resolves ordinals to names through its built-in ws2_32/
+            # oleaut32 tables; the runtime binds by the ordinal that is really
+            # in the import table, so compare the ordinal, not the name.
+            if getattr(imp, "import_by_ordinal", False) or imp.name is None:
+                name = "#%d" % imp.ordinal
+            else:
+                name = imp.name.decode()
             total += 1
             if name in impl.get(dll, set()) or name in exports.get(dll, set()):
                 have += 1
@@ -141,7 +147,7 @@ def main():
     exports = recompiled_exports(analysis, RECOMPILED)
     if not any(exports.values()):
         print("note: analysis/functions_*.json not found; recompiled exports are not counted")
-    for name in ("farcry2.exe", "Dunia.dll", "binkw32.dll"):
+    for name in ("farcry2.exe", "Dunia.dll", "binkw32.dll", "systemdetection.dll"):
         path = os.path.join(game, "bin", name)
         if os.path.exists(path):
             report(path, impl, traps, exports)

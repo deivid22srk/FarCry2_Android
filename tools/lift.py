@@ -43,6 +43,17 @@ def decode_block(a, b):
     return list(md.disasm(img[a - BASE:b - BASE], a))
 
 
+def _has_xmm(ops):
+    """True if any operand is an SSE register.
+
+    capstone spells both the string `movsd` (A5) and the SSE2 scalar
+    `movsd xmm/m64` (F2 0F 10/11) as "movsd". The string form only ever has
+    memory operands; the SSE form always has one XMM operand.
+    """
+    return any(o.type == x86.X86_OP_REG and
+               x86.X86_REG_XMM0 <= o.reg <= x86.X86_REG_XMM31 for o in ops)
+
+
 def import_via(t):
     """Import name if `t` is the IAT slot itself or a `jmp [iat]` stub."""
     if t in iat:
@@ -565,7 +576,7 @@ class Lifter:
             e("%s rt_unimpl(c, 0x%Xu, \"int\");" % (SPILL, i.address))
         elif mn.split()[-1] in ("movsb", "movsw", "movsd", "stosb", "stosw", "stosd", "lodsb", "lodsd",
                                 "cmpsb", "cmpsd", "cmpsw", "scasb", "scasd", "scasw", "lodsw") and \
-                not (mn.endswith("movsd") and ops and ops[0].type == x86.X86_OP_REG):
+                not (mn.split()[-1] == "movsd" and _has_xmm(ops)):
             o.extend(self.lift_string(i))
         elif mn in ("loop", "jecxz"):
             raise Unsupported(mn)  # handled as terminators
@@ -1019,6 +1030,28 @@ class Lifter:
               % (src, n, x, x, cmpop, x))
         elif mn == "cvtsi2ss":
             e("%s.f[0] = (float)(int32_t)%s;" % (self.xmm(i, ops[0]), self.get(i, ops[1])))
+        elif mn == "cvtsd2ss":  # xmm1.f[0] = (float)xmm2/m64.d[0]; the rest is kept
+            src = ("%s.d[0]" % self.xmm(i, ops[1])) if isx(ops[1]) else "MF64(%s)" % self.addr(i, ops[1])
+            e("%s.f[0] = (float)%s;" % (self.xmm(i, ops[0]), src))
+        elif mn == "cvtss2sd":  # xmm1.d[0] = (double)xmm2/m32.f[0]; the rest is kept
+            src = ("%s.f[0]" % self.xmm(i, ops[1])) if isx(ops[1]) else "MF32(%s)" % self.addr(i, ops[1])
+            e("%s.d[0] = (double)%s;" % (self.xmm(i, ops[0]), src))
+        elif mn == "cvtps2pd":  # two packed singles -> both double lanes
+            x = self.xmm(i, ops[0])
+            if isx(ops[1]):
+                e("{ Xmm s_ = %s; %s.d[0] = (double)s_.f[0]; %s.d[1] = (double)s_.f[1]; }"
+                  % (self.xmm(i, ops[1]), x, x))
+            else:
+                e("%s.d[0] = (double)MF32(%s); %s.d[1] = (double)MF32((%s) + 4);"
+                  % (x, self.addr(i, ops[1]), x, self.addr(i, ops[1])))
+        elif mn == "cvtpd2ps":  # two packed doubles -> low pair of singles, upper qword zeroed
+            x = self.xmm(i, ops[0])
+            if isx(ops[1]):
+                e("{ Xmm s_ = %s; %s.f[0] = (float)s_.d[0]; %s.f[1] = (float)s_.d[1]; %s.q[1] = 0; }"
+                  % (self.xmm(i, ops[1]), x, x, x))
+            else:
+                e("%s.f[0] = (float)MF64(%s); %s.f[1] = (float)MF64((%s) + 8); %s.q[1] = 0;"
+                  % (x, self.addr(i, ops[1]), x, self.addr(i, ops[1]), x))
         elif mn in ("cvttss2si", "cvtss2si"):
             src = ("%s.f[0]" % self.xmm(i, ops[1])) if isx(ops[1]) else "MF32(%s)" % self.addr(i, ops[1])
             fn = "truncf" if mn == "cvttss2si" else "nearbyintf"
