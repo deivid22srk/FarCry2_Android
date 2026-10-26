@@ -27,7 +27,7 @@ and the shared runtime structure (which those projects also share).
 | Host D3DX9 (`runtime/d3dx9_host.cpp`, 15 imports) | **Written**, compiles; exercised by the host run (texture creation observed) |
 | Android launcher + activity | **Written**, compiles in CI |
 | APK (app-only, stub tables) | **Built by GitHub Actions**, run [40338447334](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40338447334): `FarCry2-apk`, 2,106,960 bytes |
-| APK (full, with `gen/`) | **Built by GitHub Actions**: run [40377549175](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40377549175) → 45,540,586 bytes, then run [40398348378](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40398348378) → 45,545,214 bytes, `arm64-v8a`, `libmain.so` 109,747,328 bytes. Published as **private** release assets in [`deivid22srk/FarCry2_gen`](https://github.com/deivid22srk/FarCry2_gen) (`apk-5-20261026-1836`, `apk-6-20261026-2051`), never here |
+| APK (full, with `gen/`) | **Built by GitHub Actions**: run [40377549175](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40377549175) → 45,540,586 bytes, run [40398348378](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40398348378) → 45,545,214 bytes, run [40403855986](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40403855986) → 45,544,734 bytes, `arm64-v8a`, `libmain.so` 109,747,328 bytes. Published as **private** release assets in [`deivid22srk/FarCry2_gen`](https://github.com/deivid22srk/FarCry2_gen) (`apk-5-20261026-1836`, `apk-6-20261026-2051`, `apk-7-20261026-2135`), never here. `apk-7` contains the three fixes for the phone crash below, but has not been run on a phone yet |
 | Game on a phone | **Partially working**: the full APK installs on a real arm64 phone (Motorola Edge 30 Fusion, Android 14, Adreno 660) and the launcher opens and accepts the game folder; `farcry2.exe` → `Dunia!RunGame` boots. The user's `logcat` is from **`apk-6`** (its `libmain.so` BuildId matches that release exactly) and shows a `SIGSEGV` in the UI init, at a `NULL` entry of a lookup table only reachable because that build does not read the shipped `Data_Win32` data at all — see below |
 | Game on the host (desktop harness) | **Partially working**: boots to the engine's render loop, then dies in the UI init of the first screen (details below) |
 | SEH / C++ exceptions | **Not implemented** — top blocker, see below |
@@ -70,7 +70,9 @@ D3DX9 entry points are `__stdcall`. The disassembled `apk-6` `libmain.so` shows
 the crash is a `NULL` slot in a 256-entry table that is only empty because the
 build never opened the shipped data. With the fixes the host run gets past that
 point (`f_10425CB0`: 202 calls, 0 `NULL` entries) and stops at the screen's
-UI-element tree, as above.
+UI-element tree, as above. That fixed build is published as the private release
+**`apk-7-20261026-2135`** in `deivid22srk/FarCry2_gen`; it has not been run on a
+phone yet.
 
 Everything the run touched is listed in `docs/TESTED.md`; the pieces that abort
 loudly (SEH/C++ unwinding, unresolved indirect jumps, Bink imports) have not been
