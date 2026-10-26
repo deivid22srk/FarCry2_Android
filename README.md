@@ -27,8 +27,8 @@ and the shared runtime structure (which those projects also share).
 | Host D3DX9 (`runtime/d3dx9_host.cpp`, 15 imports) | **Written**, compiles; exercised by the host run (texture creation observed) |
 | Android launcher + activity | **Written**, compiles in CI |
 | APK (app-only, stub tables) | **Built by GitHub Actions**, run [40338447334](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40338447334): `FarCry2-apk`, 2,106,960 bytes |
-| APK (full, with `gen/`) | **Built by GitHub Actions**, run [40377549175](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40377549175): 45,540,586 bytes, `arm64-v8a`, `libmain.so` 109,747,328 bytes. Published as a **private** release asset in [`deivid22srk/FarCry2_gen`](https://github.com/deivid22srk/FarCry2_gen) (`apk-5-20261026-1836`), never here |
-| Game on a phone | **Partially working**: the full APK installs on a real arm64 phone (Motorola Edge 30 Fusion, Android 14, Adreno 660), the launcher opens the game folder, and the game boots to its render loop — then it dies in the same UI init as the host run |
+| APK (full, with `gen/`) | **Built by GitHub Actions**: run [40377549175](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40377549175) → 45,540,586 bytes, then run [40398348378](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40398348378) → 45,545,214 bytes, `arm64-v8a`, `libmain.so` 109,747,328 bytes. Published as **private** release assets in [`deivid22srk/FarCry2_gen`](https://github.com/deivid22srk/FarCry2_gen) (`apk-5-20261026-1836`, `apk-6-20261026-2051`), never here |
+| Game on a phone | **Partially working**: the full APK installs on a real arm64 phone (Motorola Edge 30 Fusion, Android 14, Adreno 660) and the launcher opens and accepts the game folder; `farcry2.exe` → `Dunia!RunGame` boots. The user's `logcat` is from **`apk-6`** (its `libmain.so` BuildId matches that release exactly) and shows a `SIGSEGV` in the UI init, at a `NULL` entry of a lookup table only reachable because that build does not read the shipped `Data_Win32` data at all — see below |
 | Game on the host (desktop harness) | **Partially working**: boots to the engine's render loop, then dies in the UI init of the first screen (details below) |
 | SEH / C++ exceptions | **Not implemented** — top blocker, see below |
 
@@ -54,10 +54,23 @@ What has been observed, running the user's own GOG copy:
 Where it stops (see `docs/TESTED.md` for the commands and the gdb evidence): the
 engine activates its first screen, `MAINMENU_INITIAL_RATING`, and dereferences
 `[screen+0x14]` — the root of that screen's UI-element tree — which is still
-`NULL`. A hardware watchpoint on the field, armed when the screen object is
-constructed, never fires: no code in the process ever writes it, so whatever is
-supposed to build the screen's elements never runs. `f_10CA2220` then calls
-`f_10A86DD0` with the `NULL` and the fault lands at guest address `0x58`.
+`NULL`. The whole constructor chain of that screen object was disassembled from
+the real PE and compared byte-for-byte with the lifted C; the only instruction
+anywhere in the chain that touches the field **zeroes** it, and a byte-level scan
+of the entire `Dunia` `.text` plus a gdb watchpoint confirm no code in the
+process ever writes a non-`NULL` value. So whatever is supposed to build the
+screen's elements never runs. `f_10CA2220` then calls `f_10A86DD0` with the
+`NULL` and the fault lands at guest address `0x58`.
+
+The **phone** run stops earlier, and for a known reason: the `apk-6` build the
+user has predates three fixes that are in the tree now — guest wide strings must
+be UTF-16 (host `wchar_t` is 4 bytes on Android/Linux), `c:\data_win32\...`
+must map to the game's `Data_Win32` rather than the save directory, and the
+D3DX9 entry points are `__stdcall`. The disassembled `apk-6` `libmain.so` shows
+the crash is a `NULL` slot in a 256-entry table that is only empty because the
+build never opened the shipped data. With the fixes the host run gets past that
+point (`f_10425CB0`: 202 calls, 0 `NULL` entries) and stops at the screen's
+UI-element tree, as above.
 
 Everything the run touched is listed in `docs/TESTED.md`; the pieces that abort
 loudly (SEH/C++ unwinding, unresolved indirect jumps, Bink imports) have not been

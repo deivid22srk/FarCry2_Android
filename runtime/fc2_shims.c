@@ -26,6 +26,7 @@
 #include "rt.h"
 #include "hcom.h"   /* guest COM objects (IStream, GpBitmap) */
 #include "art.h"    /* png_decode for the GDI+ image path */
+#include "u16.h"    /* guest wide strings are UTF-16, not the host's wchar_t */
 #include <ctype.h>
 #include <errno.h>
 #include <string.h>
@@ -77,7 +78,7 @@ SHIM(__libm_sse2_atan2) { double a = c->xmm[0].d[0], b = c->xmm[1].d[0]; RETXMMD
 SHIM(memcmp) { RETC(memcmp(GPTR(ARG(0)), GPTR(ARG(1)), ARG(2))); }
 SHIM(strcmp) { RETC(strcmp(GSTR(ARG(0)), GSTR(ARG(1)))); }
 SHIM(strlen) { RETC((uint32_t)strlen(GSTR(ARG(0)))); }
-SHIM(wcslen) { RETC((uint32_t)wcslen((const wchar_t *)GPTR(ARG(0)))); }
+SHIM(wcslen) { RETC(u16_len(GPTR(ARG(0)))); }
 SHIM(vfprintf) { RETC(0); }                   /* a guest va_list cannot cross */
 SHIM(_vsnprintf_s) { RETC(-1); }
 SHIM(vsprintf_s) { RETC(-1); }
@@ -105,21 +106,77 @@ SHIM(_memicmp) {
 SHIM(_strtoui64) { RETC((uint32_t)strtoull(GSTR(ARG(0)), NULL, ARG(2))); }
 SHIM(_atoi64) { RETC((uint32_t)strtoll(GSTR(ARG(0)), NULL, 10)); }
 SHIM(_itow) {
-    wchar_t *d = GPTR(ARG(1));
-    if (d) swprintf(d, 32, L"%d", (int32_t)ARG(0));
-    RETC((uint32_t)(uintptr_t)d - (uint32_t)(uintptr_t)MEM);
+    uint32_t d = ARG(1);
+    int32_t v = (int32_t)ARG(0);
+    char tmp[16];
+    int k = 0, neg = v < 0;
+    uint32_t uv = neg ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
+    if (!d) RETC(d);
+    do { tmp[k++] = (char)('0' + uv % 10); uv /= 10; } while (uv);
+    if (neg) tmp[k++] = '-';
+    for (int i = 0; i < k; i++) M16(d + 2u * (uint32_t)i) = (uint16_t)tmp[k - 1 - i];
+    M16(d + 2u * (uint32_t)k) = 0;
+    RETC(d);
 }
-SHIM(_wtoi) { RETC((uint32_t)wcstol((const wchar_t *)GPTR(ARG(0)), NULL, 10)); }
+SHIM(_wtoi) {
+    const uint8_t *p = (const uint8_t *)GPTR(ARG(0));
+    if (!p) RETC(0);
+    uint32_t i = 0;
+    while (u16_at(p, i) == ' ' || u16_at(p, i) == '\t') i++;
+    int neg = 0;
+    if (u16_at(p, i) == '-') { neg = 1; i++; }
+    else if (u16_at(p, i) == '+') i++;
+    int32_t v = 0;
+    for (;;) {
+        uint16_t ch = u16_at(p, i);
+        if (ch < '0' || ch > '9') break;
+        v = v * 10 + (int32_t)(ch - '0');
+        i++;
+    }
+    RETC((uint32_t)(neg ? -v : v));
+}
 SHIM(_wcslwr) {
-    wchar_t *p = GPTR(ARG(0));
-    for (wchar_t *q = p; q && *q; q++) *q = towlower(*q);
-    RETC((uint32_t)(uintptr_t)p - (uint32_t)(uintptr_t)MEM);
+    uint32_t a = ARG(0);
+    for (uint32_t i = 0; M16(a + 2u * i); i++) {
+        uint16_t ch = M16(a + 2u * i);
+        if (ch >= 'A' && ch <= 'Z') M16(a + 2u * i) = (uint16_t)(ch + 32);
+    }
+    RETC(a);
 }
 SHIM(towupper) { RETC(towupper((wint_t)ARG(0))); }
 SHIM(towlower) { RETC(towlower((wint_t)ARG(0))); }
-SHIM(wcsstr) { RETC((uint32_t)(uintptr_t)wcsstr((const wchar_t *)GPTR(ARG(0)), (const wchar_t *)GPTR(ARG(1))) - (uint32_t)(uintptr_t)MEM); }
-SHIM(wcsncpy) { RETC((uint32_t)(uintptr_t)wcsncpy((wchar_t *)GPTR(ARG(0)), (const wchar_t *)GPTR(ARG(1)), ARG(2)) - (uint32_t)(uintptr_t)MEM); }
-SHIM(wcscspn) { RETC((uint32_t)wcscspn((const wchar_t *)GPTR(ARG(0)), (const wchar_t *)GPTR(ARG(1)))); }
+SHIM(wcsstr) {
+    const void *h = GPTR(ARG(0)), *n = GPTR(ARG(1));
+    if (!h || !n) RETC(0);
+    uint32_t hl = u16_len(h), nl = u16_len(n);
+    if (nl > hl) RETC(0);
+    for (uint32_t i = 0; i + nl <= hl; i++)
+        if (u16_cmp_n((const uint8_t *)h + 2u * i, n, nl) == 0)
+            RETC((uint32_t)((uintptr_t)h - (uintptr_t)MEM) + 2u * i);
+    RETC(0);
+}
+SHIM(wcsncpy) {
+    uint32_t d = ARG(0), s = ARG(1), n = ARG(2);
+    uint32_t i = 0;
+    for (; i < n; i++) {
+        uint16_t ch = M16(s + 2u * i);
+        M16(d + 2u * i) = ch;
+        if (!ch) break;
+    }
+    for (; i < n; i++) M16(d + 2u * i) = 0;
+    RETC(d);
+}
+SHIM(wcscspn) {
+    const void *s = GPTR(ARG(0)), *set = GPTR(ARG(1));
+    uint32_t i = 0;
+    for (; u16_at(s, i); i++) {
+        int found = 0;
+        for (uint32_t j = 0; u16_at(set, j); j++)
+            if (u16_at(s, i) == u16_at(set, j)) { found = 1; break; }
+        if (found) break;
+    }
+    RETC(i);
+}
 SHIM(_vswprintf) { RETC(-1); }
 SHIM(_vswprintf_c_l) { RETC(-1); }
 /* ldiv_t is 8 bytes, returned in eax:edx (no hidden pointer on x86). */
@@ -277,7 +334,7 @@ typedef struct { uint32_t hdr; uint32_t bx; uint32_t pad[3]; uint32_t size, res;
  * which either read unmapped memory or, via the `ptr - MEM` idiom, handed the
  * engine an address that was not the string at all.) */
 static char *vc8_ptr(Vc8Str *s) { return s->res >= 16 ? (char *)MEM + s->bx : (char *)&s->bx; }
-static wchar_t *vc8_wptr(Vc8Str *s) { return s->res >= 8 ? (wchar_t *)(MEM + s->bx) : (wchar_t *)&s->bx; }
+static uint16_t *vc8_wptr(Vc8Str *s) { return s->res >= 8 ? (uint16_t *)(MEM + s->bx) : (uint16_t *)&s->bx; }
 /* c_str() hands the engine a guest address. */
 static uint32_t vc8_data_g(Vc8Str *s) { return (uint32_t)((uint8_t *)vc8_ptr(s) - MEM); }
 static uint32_t vc8_wdata_g(Vc8Str *s) { return (uint32_t)((uint8_t *)vc8_wptr(s) - MEM); }
@@ -296,12 +353,12 @@ static void vc8_set_c(Vc8Str *s, const char *p, uint32_t n) {
     }
     s->size = n;
 }
-static void vc8_set_w(Vc8Str *s, const wchar_t *p, uint32_t n) {
+static void vc8_set_w(Vc8Str *s, const void *p, uint32_t n) {
     s->hdr = VC8_EMPTY;
     if (n < 8) {
         s->res = 7;
-        memcpy(&s->bx, p, 2 * n);
-        ((wchar_t *)&s->bx)[n] = 0;
+        if (n) memcpy(&s->bx, p, 2u * n);
+        ((uint16_t *)&s->bx)[n] = 0;
     } else {
         uint32_t d = gmalloc(2 * (n + 1));
         memcpy(MEM + d, p, 2 * n);
@@ -341,8 +398,8 @@ SHIM(str_c_str) { Vc8Str *s = GPTR(THIS); RET(s ? vc8_data_g(s) : 0, 0); }
 SHIM(str_wc_str) { Vc8Str *s = GPTR(THIS); RET(s ? vc8_wdata_g(s) : 0, 0); }
 SHIM(str_w_ctor_cstr) {
     Vc8Str *s = GPTR(THIS);
-    const wchar_t *p = (const wchar_t *)GPTR(ARG(0));
-    vc8_set_w(s, p ? p : L"", p ? (uint32_t)wcslen(p) : 0);
+    const void *p = GPTR(ARG(0));
+    vc8_set_w(s, p, u16_len(p));
     RET(0, 1);
 }
 SHIM(str_w_dtor) {
@@ -352,13 +409,13 @@ SHIM(str_w_dtor) {
     s->res = 7;
     s->size = 0;
     s->hdr = VC8_EMPTY;
-    ((wchar_t *)&s->bx)[0] = 0;
+    ((uint16_t *)&s->bx)[0] = 0;
     RET(0, 0);
 }
 
 /* char_traits: static members are __cdecl. */
 SHIM(tr_length) { RETC((uint32_t)strlen(GSTR(ARG(0)))); }
-SHIM(tr_wlength) { RETC((uint32_t)wcslen((const wchar_t *)GPTR(ARG(0)))); }
+SHIM(tr_wlength) { RETC(u16_len(GPTR(ARG(0)))); }
 SHIM(tr_assign_c) { M8(ARG(0)) = M8(ARG(1)); RETC(0); }
 SHIM(tr_assign_w) { M16(ARG(0)) = M16(ARG(1)); RETC(0); }
 SHIM(tr_assign_n) {

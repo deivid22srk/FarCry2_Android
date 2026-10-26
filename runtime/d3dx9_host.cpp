@@ -15,7 +15,10 @@
  * below does not know. They log the call and fail with E_NOTIMPL/E_FAIL
  * instead of silently returning garbage.
  *
- * All 15 are cdecl: the caller pops the arguments (RETC). */
+ * All 15 are WINAPI (__stdcall): the callee pops the return address and its
+ * arguments (RET with the argument count). The recompiled callers push the
+ * arguments and do not adjust esp afterwards, so a cdecl return here would
+ * leave the guest stack short and corrupt whatever the caller reads next. */
 #include <d3d9.h>
 #include <cstdint>
 #include <cstring>
@@ -120,24 +123,24 @@ static bool matrix_inverse(float *o, const float *m, float *detOut) {
 
 extern "C" void shim_D3DXPlaneNormalize(CPU *c) {
     plane_normalize((float *)GPTR(ARG(0)), (const float *)GPTR(ARG(1)));
-    RETC(ARG(0));
+    RET(ARG(0), 2);
 }
 
 extern "C" void shim_D3DXPlaneTransform(CPU *c) {
     plane_transform((float *)GPTR(ARG(0)), (const float *)GPTR(ARG(1)), (const float *)GPTR(ARG(2)));
-    RETC(ARG(0));
+    RET(ARG(0), 3);
 }
 
 extern "C" void shim_D3DXMatrixTranspose(CPU *c) {
     matrix_transpose((float *)GPTR(ARG(0)), (const float *)GPTR(ARG(1)));
-    RETC(ARG(0));
+    RET(ARG(0), 2);
 }
 
 extern "C" void shim_D3DXMatrixInverse(CPU *c) {
     float det = 0;
     bool ok = matrix_inverse((float *)GPTR(ARG(0)), (const float *)GPTR(ARG(2)), &det);
     if (ARG(1)) *(float *)GPTR(ARG(1)) = det;
-    RETC(ok ? ARG(0) : 0);
+    RET(ok ? ARG(0) : 0, 3);
 }
 
 // ---------------------------------------------------------------- formats
@@ -541,7 +544,7 @@ extern "C" void shim_D3DXGetImageInfoFromFileInMemory(CPU *c) {
         }
     }
     if (FAILED(hr)) LOG("D3DXGetImageInfoFromFileInMemory: unknown image (%u bytes)", n);
-    RETC(hr);
+    RET(hr, 3);
 }
 
 static IDirect3DTexture9 *create_tex(IDirect3DDevice9 *dev, UINT w, UINT h, UINT levels, DWORD usage, D3DFORMAT fmt, D3DPOOL pool) {
@@ -571,11 +574,11 @@ extern "C" void shim_D3DXCreateTextureFromFileInMemoryEx(CPU *c) {
         if (!ok) {
             LOG("D3DXCreateTextureFromFileInMemoryEx: unsupported image (%u bytes); only DDS/BMP/TGA are decoded", n);
             M32(outTex) = 0;
-            RETC(E_NOTIMPL);
+            RET(E_NOTIMPL, 15);
         }
         D3DFORMAT fmt = reqFmt == D3DFMT_UNKNOWN ? D3DFMT_A8R8G8B8 : reqFmt;
         IDirect3DTexture9 *tex = create_tex(dev, (UINT)w, (UINT)h, 1, usage, fmt, pool);
-        if (!tex) { M32(outTex) = 0; RETC(E_FAIL); }
+        if (!tex) { M32(outTex) = 0; RET(E_FAIL, 15); }
         IDirect3DSurface9 *surf = nullptr;
         tex->GetSurfaceLevel(0, &surf);
         if (surf) {
@@ -588,13 +591,13 @@ extern "C" void shim_D3DXCreateTextureFromFileInMemoryEx(CPU *c) {
             srcInfo->Format = f; srcInfo->ResourceType = D3DRTYPE_TEXTURE; srcInfo->ImageFileFormat = D3DXIFF_BMP;
         }
         M32(outTex) = d3d9_wrap(tex, IFACE_IDirect3DTexture9);
-        RETC(S_OK);
+        RET(S_OK, 15);
     }
 
     if (d.cube || d.volume) {
         LOG("D3DXCreateTextureFromFileInMemoryEx: cube/volume DDS needs the matching D3DX entry point");
         M32(outTex) = 0;
-        RETC(E_FAIL);
+        RET(E_FAIL, 15);
     }
     UINT w = reqW == D3DX_DEFAULT_ ? d.w : reqW;
     UINT h = reqH == D3DX_DEFAULT_ ? d.h : reqH;
@@ -603,7 +606,7 @@ extern "C" void shim_D3DXCreateTextureFromFileInMemoryEx(CPU *c) {
     if (!levels) levels = 1;
     D3DFORMAT fmt = reqFmt == D3DFMT_UNKNOWN ? d.fmt : reqFmt;
     IDirect3DTexture9 *tex = create_tex(dev, w, h, levels, usage, fmt, pool);
-    if (!tex) { M32(outTex) = 0; RETC(E_FAIL); }
+    if (!tex) { M32(outTex) = 0; RET(E_FAIL, 15); }
     for (UINT l = 0; l < levels; l++) {
         IDirect3DSurface9 *surf = nullptr;
         if (FAILED(tex->GetSurfaceLevel(l, &surf)) || !surf) continue;
@@ -641,7 +644,7 @@ extern "C" void shim_D3DXCreateTextureFromFileInMemoryEx(CPU *c) {
         srcInfo->Format = d.fmt; srcInfo->ResourceType = D3DRTYPE_TEXTURE; srcInfo->ImageFileFormat = D3DXIFF_DDS;
     }
     M32(outTex) = d3d9_wrap(tex, IFACE_IDirect3DTexture9);
-    RETC(S_OK);
+    RET(S_OK, 15);
 }
 
 extern "C" void shim_D3DXCreateCubeTextureFromFileInMemoryEx(CPU *c) {
@@ -658,7 +661,7 @@ extern "C" void shim_D3DXCreateCubeTextureFromFileInMemoryEx(CPU *c) {
     if (!parse_dds(p, n, &d) || !d.cube) {
         LOG("D3DXCreateCubeTextureFromFileInMemoryEx: only DDS cube maps are supported");
         M32(outTex) = 0;
-        RETC(E_NOTIMPL);
+        RET(E_NOTIMPL, 14);
     }
     UINT edge = reqEdge == D3DX_DEFAULT_ ? d.w : reqEdge;
     UINT levels = reqMips == D3DX_DEFAULT_ ? d.mips : std::min(reqMips, d.mips);
@@ -666,7 +669,7 @@ extern "C" void shim_D3DXCreateCubeTextureFromFileInMemoryEx(CPU *c) {
     D3DFORMAT fmt = reqFmt == D3DFMT_UNKNOWN ? d.fmt : reqFmt;
     IDirect3DCubeTexture9 *tex = nullptr;
     HRESULT hr = dev->CreateCubeTexture(edge, levels, usage, fmt, pool, &tex, nullptr);
-    if (FAILED(hr) || !tex) { LOG("D3DX: CreateCubeTexture -> %08x", (unsigned)hr); M32(outTex) = 0; RETC(E_FAIL); }
+    if (FAILED(hr) || !tex) { LOG("D3DX: CreateCubeTexture -> %08x", (unsigned)hr); M32(outTex) = 0; RET(E_FAIL, 14); }
     for (UINT f = 0; f < 6; f++) {
         for (UINT l = 0; l < levels; l++) {
             IDirect3DSurface9 *surf = nullptr;
@@ -701,7 +704,7 @@ extern "C" void shim_D3DXCreateCubeTextureFromFileInMemoryEx(CPU *c) {
         srcInfo->Format = d.fmt; srcInfo->ResourceType = D3DRTYPE_CUBETEXTURE; srcInfo->ImageFileFormat = D3DXIFF_DDS;
     }
     M32(outTex) = d3d9_wrap(tex, IFACE_IDirect3DCubeTexture9);
-    RETC(S_OK);
+    RET(S_OK, 14);
 }
 
 extern "C" void shim_D3DXLoadSurfaceFromMemory(CPU *c) {
@@ -711,7 +714,7 @@ extern "C" void shim_D3DXLoadSurfaceFromMemory(CPU *c) {
     D3DFORMAT srcFmt = (D3DFORMAT)ARG(4);
     UINT srcPitch = ARG(5);
     const RECT *srcRect = (const RECT *)GPTR(ARG(7));
-    if (!dst || !src) RETC(D3DERR_INVALIDCALL);
+    if (!dst || !src) RET(D3DERR_INVALIDCALL, 10);
     D3DSURFACE_DESC dd;
     dst->GetDesc(&dd);
     int w = srcRect ? (int)(srcRect->right - srcRect->left) : (int)dd.Width;
@@ -721,10 +724,10 @@ extern "C" void shim_D3DXLoadSurfaceFromMemory(CPU *c) {
     std::vector<uint32_t> px((size_t)w * h);
     if (!decode_raw(p, w, h, (int)srcPitch, srcFmt, px.data())) {
         LOG("D3DXLoadSurfaceFromMemory: unsupported source format %d", (int)srcFmt);
-        RETC(E_NOTIMPL);
+        RET(E_NOTIMPL, 10);
     }
     blit_argb(dst, dstRect, px.data(), w, h, dd.Format);
-    RETC(S_OK);
+    RET(S_OK, 10);
 }
 
 extern "C" void shim_D3DXLoadSurfaceFromSurface(CPU *c) {
@@ -732,7 +735,7 @@ extern "C" void shim_D3DXLoadSurfaceFromSurface(CPU *c) {
     const RECT *dstRect = (const RECT *)GPTR(ARG(2));
     IDirect3DSurface9 *src = (IDirect3DSurface9 *)com_host(ARG(3));
     const RECT *srcRect = (const RECT *)GPTR(ARG(5));
-    if (!dst || !src) RETC(D3DERR_INVALIDCALL);
+    if (!dst || !src) RET(D3DERR_INVALIDCALL, 8);
     D3DSURFACE_DESC sd, dd;
     src->GetDesc(&sd);
     dst->GetDesc(&dd);
@@ -741,18 +744,18 @@ extern "C" void shim_D3DXLoadSurfaceFromSurface(CPU *c) {
     std::vector<uint32_t> px((size_t)w * h);
     D3DLOCKED_RECT lr;
     RECT sr = srcRect ? *srcRect : RECT{0, 0, (LONG)sd.Width, (LONG)sd.Height};
-    if (FAILED(src->LockRect(&lr, &sr, D3DLOCK_READONLY))) RETC(D3DERR_INVALIDCALL);
+    if (FAILED(src->LockRect(&lr, &sr, D3DLOCK_READONLY))) RET(D3DERR_INVALIDCALL, 8);
     const uint8_t *base = (const uint8_t *)lr.pBits;
     if (is_compressed(sd.Format)) {
         decode_bc(base, w, h, lr.Pitch, sd.Format, px.data(), w);
     } else if (!decode_raw(base, w, h, lr.Pitch, sd.Format, px.data())) {
         src->UnlockRect();
         LOG("D3DXLoadSurfaceFromSurface: unsupported source format %d", (int)sd.Format);
-        RETC(E_NOTIMPL);
+        RET(E_NOTIMPL, 8);
     }
     src->UnlockRect();
     blit_argb(dst, dstRect, px.data(), w, h, dd.Format);
-    RETC(S_OK);
+    RET(S_OK, 8);
 }
 
 /* Mip chain filter for 2-D textures: box-average 2x2 (or 4x4 for larger
@@ -761,23 +764,23 @@ extern "C" void shim_D3DXLoadSurfaceFromSurface(CPU *c) {
 extern "C" void shim_D3DXFilterTexture(CPU *c) {
     IDirect3DBaseTexture9 *base = (IDirect3DBaseTexture9 *)com_host(ARG(0));
     UINT srcLevel = ARG(2);
-    if (!base) RETC(D3DERR_INVALIDCALL);
+    if (!base) RET(D3DERR_INVALIDCALL, 4);
     D3DRESOURCETYPE type = base->GetType();
     if (type == D3DRTYPE_CUBETEXTURE) {
         // filter each face independently by recursing on GetCubeMapSurface is
         // not exposed here; report instead of writing wrong pixels
         LOG("D3DXFilterTexture: cube maps keep the mips stored in the DDS file");
-        RETC(S_OK);
+        RET(S_OK, 4);
     }
     if (type != D3DRTYPE_TEXTURE) {
         LOG("D3DXFilterTexture: unsupported resource type %d", (int)type);
-        RETC(E_NOTIMPL);
+        RET(E_NOTIMPL, 4);
     }
     IDirect3DTexture9 *tex = (IDirect3DTexture9 *)base;
     D3DSURFACE_DESC sd;
     IDirect3DSurface9 *s0 = nullptr;
     tex->GetSurfaceLevel(srcLevel, &s0);
-    if (!s0) RETC(D3DERR_INVALIDCALL);
+    if (!s0) RET(D3DERR_INVALIDCALL, 4);
     s0->GetDesc(&sd);
     UINT levels = tex->GetLevelCount();
     UINT w = sd.Width, h = sd.Height;
@@ -785,18 +788,18 @@ extern "C" void shim_D3DXFilterTexture(CPU *c) {
     s0->Release();
     if (is_compressed(fmt)) {
         LOG("D3DXFilterTexture: compressed texture keeps its stored mip levels");
-        RETC(S_OK);
+        RET(S_OK, 4);
     }
     if (!bytes_per_pixel(fmt)) {
         LOG("D3DXFilterTexture: unsupported format %d", (int)fmt);
-        RETC(E_NOTIMPL);
+        RET(E_NOTIMPL, 4);
     }
     std::vector<uint32_t> prev((size_t)w * h);
     {
         IDirect3DSurface9 *s = nullptr;
         tex->GetSurfaceLevel(srcLevel, &s);
         D3DLOCKED_RECT lr;
-        if (!s || FAILED(s->LockRect(&lr, nullptr, D3DLOCK_READONLY))) { if (s) s->Release(); RETC(D3DERR_INVALIDCALL); }
+        if (!s || FAILED(s->LockRect(&lr, nullptr, D3DLOCK_READONLY))) { if (s) s->Release(); RET(D3DERR_INVALIDCALL, 4); }
         decode_raw((const uint8_t *)lr.pBits, w, h, lr.Pitch, fmt, prev.data());
         s->UnlockRect();
         s->Release();
@@ -830,13 +833,13 @@ extern "C" void shim_D3DXFilterTexture(CPU *c) {
         prev.swap(cur);
         pw = nw; ph = nh;
     }
-    RETC(S_OK);
+    RET(S_OK, 4);
 }
 
 extern "C" void shim_D3DXFillTexture(CPU *c) {
     IDirect3DTexture9 *tex = (IDirect3DTexture9 *)com_host(ARG(0));
     uint32_t fn = ARG(1), data = ARG(2);
-    if (!tex || !fn) RETC(D3DERR_INVALIDCALL);
+    if (!tex || !fn) RET(D3DERR_INVALIDCALL, 3);
     CPU *cpu = rt_current_cpu();
     UINT levels = tex->GetLevelCount();
     uint32_t out = gmalloc(16), tc = gmalloc(8), ts = gmalloc(8);
@@ -872,7 +875,7 @@ extern "C" void shim_D3DXFillTexture(CPU *c) {
         s->Release();
     }
     gfree(out); gfree(tc); gfree(ts);
-    RETC(S_OK);
+    RET(S_OK, 3);
 }
 
 /* Writes a DDS file (all mip levels) or a 32-bit BMP. PNG/JPG/TGA saving is
@@ -1003,14 +1006,14 @@ static HRESULT save_texture(const char *path, int format, IDirect3DBaseTexture9 
 extern "C" void shim_D3DXSaveTextureToFileW(CPU *c) {
     char host[1024];
     rt_host_path((const char *)GPTR(ARG(0)), host, sizeof host);
-    RETC(save_texture(host, (int)ARG(1), (IDirect3DBaseTexture9 *)com_host(ARG(2))));
+    RET(save_texture(host, (int)ARG(1), (IDirect3DBaseTexture9 *)com_host(ARG(2))), 4);
 }
 
 extern "C" void shim_D3DXSaveTextureToFileInMemory(CPU *c) {
     LOG("D3DXSaveTextureToFileInMemory: needs an ID3DXBuffer object, which this runtime does not "
         "implement; use D3DXSaveTextureToFile with a path instead");
     M32(ARG(0)) = 0;
-    RETC(E_NOTIMPL);
+    RET(E_NOTIMPL, 4);
 }
 
 /* ---------------------------------------------------------------- shaders */
@@ -1024,9 +1027,9 @@ extern "C" void shim_D3DXGetShaderInputSemantics(CPU *c) {
     const uint32_t *code = (const uint32_t *)GPTR(ARG(0));
     D3DXSEMANTIC *out = (D3DXSEMANTIC *)GPTR(ARG(1));
     uint32_t cntp = ARG(2);
-    if (!code || !cntp) RETC(E_INVALIDARG);
+    if (!code || !cntp) RET(E_INVALIDARG, 3);
     uint32_t version = code[0];
-    if ((version & 0xFFFF0000u) != 0xFFFE0000u) { *(uint32_t *)GPTR(cntp) = 0; RETC(E_FAIL); }
+    if ((version & 0xFFFF0000u) != 0xFFFE0000u) { *(uint32_t *)GPTR(cntp) = 0; RET(E_FAIL, 3); }
     UINT major = (version >> 8) & 0xFF;
     UINT n = 0;
     if (major == 1) {
@@ -1054,7 +1057,7 @@ extern "C" void shim_D3DXGetShaderInputSemantics(CPU *c) {
         }
     }
     *(uint32_t *)GPTR(cntp) = n;
-    RETC(S_OK);
+    RET(S_OK, 3);
 }
 
 /* Spherical harmonics projection of a cube map, D3DXSHProjectCubeMap order
@@ -1106,7 +1109,7 @@ extern "C" void shim_D3DXSHProjectCubeMap(CPU *c) {
     UINT order = ARG(0);
     IDirect3DCubeTexture9 *cube = (IDirect3DCubeTexture9 *)com_host(ARG(1));
     float *ro = (float *)GPTR(ARG(2)), *go = (float *)GPTR(ARG(3)), *bo = (float *)GPTR(ARG(4));
-    if (!cube || order < 1 || order > 5 || !ro || !go || !bo) RETC(E_INVALIDARG);
+    if (!cube || order < 1 || order > 5 || !ro || !go || !bo) RET(E_INVALIDARG, 5);
     UINT ncoef = order * order;
     for (UINT i = 0; i < ncoef; i++) { ro[i] = go[i] = bo[i] = 0; }
     const int S = 16;  // samples per face edge
@@ -1149,7 +1152,7 @@ extern "C" void shim_D3DXSHProjectCubeMap(CPU *c) {
         s->UnlockRect();
         s->Release();
     }
-    RETC(S_OK);
+    RET(S_OK, 5);
 }
 
 static const ShimDef defs[] = {

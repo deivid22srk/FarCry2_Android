@@ -576,6 +576,9 @@ typedef struct { DIR *d; char dir[1024]; char pat[260]; } GFind;
 
 static const char *k_win_game_prefix = GAME_WIN_PREFIX;
 static const char *k_win_user_prefix = "\\users\\player\\";
+#if defined(GAME_FC2)
+static const char *k_win_data_prefix = "\\data_win32\\";
+#endif
 
 /* Directory listings for case-insensitive lookups. Android's shared storage
    is slow per syscall, and the game probes thousands of missing files (the
@@ -691,6 +694,16 @@ int rt_host_path(const char *win, char *out, size_t outsz) {
     if (!strncasecmp(tmp, k_win_game_prefix, strlen(k_win_game_prefix))) {
         root = g_game_dir;
         rel = tmp + strlen(k_win_game_prefix);
+#if defined(GAME_FC2)
+    } else if (!strncasecmp(tmp, k_win_data_prefix, strlen(k_win_data_prefix))) {
+        /* Far Cry 2's engine asks for its shipped data as C:\data_win32\<rest>,
+         * which is the install's Data_Win32 folder. Keep the "data_win32"
+         * component and let resolve_ci() match Data_Win32 case-insensitively;
+         * mapping it to g_save_dir (the old catch-all) hid the whole 3.3 GB of
+         * assets from the engine. */
+        root = g_game_dir;
+        rel = tmp + 1;
+#endif
     } else if (!strncasecmp(tmp, k_win_user_prefix, strlen(k_win_user_prefix))) {
         root = g_save_dir;
         rel = tmp + strlen(k_win_user_prefix);
