@@ -18,12 +18,12 @@ and the shared runtime structure (which those projects also share).
 
 | Area | State |
 |---|---|
-| PE recon of `farcry2.exe`, `Dunia.dll`, `binkw32.dll` | **Done**, every fact in [`docs/RECON.md`](docs/RECON.md) read from the binaries |
+| PE recon of `farcry2.exe`, `Dunia.dll`, `binkw32.dll`, `systemdetection.dll` | **Done**, every fact in [`docs/RECON.md`](docs/RECON.md) read from the binaries |
 | Boot path disassembly (exe → `Dunia.dll!RunGame`) | **Done**, `docs/RECON.md` §3 |
 | Function discovery (`Dunia.dll`, 14.1 MB of code) | **Done**: 82,403 functions, 95.5 % coverage |
-| x86 → C lifting of all three modules | **Done**: 82,643 functions lifted, 259 rejected |
+| x86 → C lifting of all four modules | **Done**: 83,940 functions lifted, 261 rejected |
 | Runtime (`runtime/`, CRT/Win32/D3D9/DSound/input shims) | **Written**, compiles for `GAME_FC2` on a host |
-| Import resolution of the three modules | **Done**: every import resolves (`tools/import_coverage.py`); 0 abort stubs |
+| Import resolution of the four modules | **Done**: every import resolves (`tools/import_coverage.py`); 0 unregistered imports, 0 abort stubs |
 | Host D3DX9 (`runtime/d3dx9_host.cpp`, 15 imports) | **Written**, compiles; not exercised by a game run |
 | Android launcher + activity | **Written**, compiles in CI |
 | APK (app-only, stub tables) | **Built by GitHub Actions**, run [40338447334](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40338447334): `FarCry2-apk`, 2,106,960 bytes |
@@ -103,11 +103,11 @@ python3 -m pip install capstone==5.0.9 pefile==2024.8.26
 tools/regen_gen.sh "/path/to/Far Cry 2"
 ```
 
-`regen_gen.sh` runs `tools/discover.py` on `farcry2.exe`, `Dunia.dll` and
-`binkw32.dll`, then `tools/lift.py` on each. On a 2026 laptop it takes roughly
-15–25 minutes and produces ~283 MB of C in 427 files (`analysis/` holds the
-discovery JSON). Expect **~1.1 GB of object files** and **~1 hour** to compile
-them on a CI runner with three parallel jobs.
+`regen_gen.sh` runs `tools/discover.py` on `farcry2.exe`, `Dunia.dll`,
+`binkw32.dll` and `systemdetection.dll`, then `tools/lift.py` on each. On a 2026
+laptop it takes roughly 15–25 minutes and produces ~288 MB of C in 692 files
+(`analysis/` holds the discovery JSON). Expect **~1.1 GB of object files** and
+**1–2 hours** to compile them on a CI runner with three parallel jobs.
 
 ### 2. Build the APK (GitHub Actions only)
 
@@ -125,16 +125,24 @@ Full-build setup (the recommended "strategy C"):
 2. Run `tools/regen_gen.sh` locally, then pack and upload the result to a
    release of that private repo:
    ```sh
-   tar --zstd -cf gen.tar.zst gen
-   gh release create gen1 gen.tar.zst --repo deivid22srk/FarCry2_gen
+   tar --use-compress-program='zstd -T4 -3' -cf gen.tar.zst gen
+   sha256sum gen.tar.zst
+   gh release create gen-v1 gen.tar.zst --repo deivid22srk/FarCry2_gen
    ```
+   Pack with `--use-compress-program=unzstd` extraction in mind (that is what
+   `build.yml` uses); the archive must have `gen/` at its top level. Add a new
+   tag (and bump `GEN_TAG`) whenever `gen/` is re-lifted.
 3. In the public repo: *Settings → Secrets and variables → Actions*
    * secret `GEN_TOKEN`: a fine-grained token with `Contents: read/write` on
      `FarCry2_gen` (needed to download and to publish the APK there);
    * variable `GEN_REPO`: `deivid22srk/FarCry2_gen`;
-   * variable `GEN_TAG`: `gen1`.
+   * variable `GEN_TAG`: `gen-v1`.
 4. Run the **build** workflow. The APK is published to
    `https://github.com/deivid22srk/FarCry2_gen/releases`.
+
+This is exactly how the maintainer's repository is wired: `GEN_REPO` =
+`deivid22srk/FarCry2_gen`, `GEN_TAG` = `gen-v1`, and a `GEN_TOKEN` that lives
+only as an Actions secret.
 
 Never point `GEN_REPO` at a public repository: the APK contains recompiled
 Ubisoft code and must stay private.

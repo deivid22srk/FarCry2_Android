@@ -140,7 +140,9 @@ Graphics is D3D9 with shader model 2/3 (the game ships precompiled shaders in
 `Data_Win32/shadersobj.*`), audio is DirectSound8 plus EAX, input is DInput8 and
 XInput, video is Bink 1.9a.
 
-## 5. `binkw32.dll`
+## 5. `binkw32.dll` and `systemdetection.dll` (lifted, rebased)
+
+### `binkw32.dll`
 
 | Property | Value |
 |---|---|
@@ -156,6 +158,26 @@ original. Its preferred base `0x18000000` collides with the guest TEB used by
 the runtime (see §7), so the port rebases it to **`0x09000000`**. The image has
 `.reloc`, so this is legal; the recompiled code is emitted for the new base and
 the PE headers are still read for data/imports.
+
+### `systemdetection.dll`
+
+| Property | Value |
+|---|---|
+| Base / entry | `0x10000000` / `0x1001ab68` |
+| Size / image | 275,080 / `0x44000` |
+| Sections | `.text`, `.rdata`, `.data`, `.rsrc`, `.reloc` |
+| Exports | 2: `GetHardwareInstance`, `GetScoreInstance` |
+| Imports | 140 from `ADVAPI32`, `GDI32`, `KERNEL32`, `OLEAUT32`, `OPENGL32`, `USER32`, `d3d9`, `ole32` |
+| Version | 1, 0, 0, 2, Ubisoft Entertainment, "System Detection DLL — Powered by Gear" |
+
+Dunia calls `LoadLibraryA("systemdetection.dll")` at startup and resolves the two
+exports with `GetProcAddress`; each returns a COM-like object that Dunia queries
+through its vtable. That contract is only knowable from the code, so the module
+is recompiled rather than mocked. Its preferred base `0x10000000` is Dunia's own
+address, so it is rebased to **`0x12000000`** (it has `.reloc`). Its OpenGL and
+D3D9 imports are used to enumerate the GPU; the runtime answers them from the
+host (`runtime/misc.c`, `runtime/d3d9_bridge.cpp`), and the WMI/ADVAPI32 path it
+may take instead is stubbed.
 
 ## 6. `FC2.dll` — SecuROM, excluded
 
@@ -186,6 +208,7 @@ places the images at their original (or rebased) addresses:
 | `farcry2.exe` | `0x00400000` | `0x9000` |
 | `binkw32.dll` (rebased) | `0x09000000` | `0x38000` |
 | `Dunia.dll` | `0x10000000` | `0x192a000` |
+| `systemdetection.dll` (rebased) | `0x12000000` | `0x44000` |
 | thread stacks (32 slots) | `0x20000000` – `0x28000000` | 4 MiB each |
 | TEB (one page per thread) | `0x28000000` | |
 | PEB / environment / misc | `0x28100000` | |
@@ -195,7 +218,9 @@ places the images at their original (or rebased) addresses:
 
 The layout is `GAME_FC2`-specific in `runtime/rt.h`. The USM/LEGO layout put the
 stacks at `0x10000000`, which is where Dunia lives, hence the move and the Bink
-rebase.
+rebase. `systemdetection.dll` would also load at `0x10000000` (its own preferred
+base, and Dunia's address), so it is rebased to `0x12000000`; Dunia resolves it
+with `LoadLibraryA`/`GetProcAddress` at startup.
 
 `farcry2.exe` has **no relocations**, so it can only be loaded at `0x00400000`.
 Dunia has relocations but is loaded at its preferred base, so its absolute
@@ -234,7 +259,7 @@ and a log line instead of silently returning garbage.
 | `DSOUND` #11/#2, `EAX` #6 | `runtime/dsound.c` (SDL2 audio), EAX ignored |
 | `binkw32` (16) | **recompiled** `gen/bink_*.c` |
 | `MSVCR80` (180) | `runtime/msvcrt.c` + `runtime/crt_shims.c` (aliased `msvcr80`) + `runtime/fc2_shims.c` |
-| `MSVCP80` (71) | `basic_string`/`char_traits`/`std::exception` implemented; iostreams are loud traps |
+| `MSVCP80` (71) | `basic_string`/`char_traits`/`std::exception` implemented, plus the iostream/stringstream subset the engine uses (`GStream`: a file-backed streambuf with `operator<<`/`operator>>`/`getline`); anything outside that subset is a loud trap |
 | Win32 (KERNEL32/USER32/GDI32/…) | `runtime/kernel32.c`, `user32.c`, `misc.c`, `fc2_shims.c` |
 | Winsock/WinHTTP/WinINet/Secur32/Crypt32 | offline stubs in `runtime/fc2_shims.c` |
 | `dbghelp`, `psapi`, `iphlpapi`, `rpcrt4` | stubs in `runtime/fc2_shims.c` |
@@ -243,15 +268,30 @@ and a log line instead of silently returning garbage.
 shim tables and reports where each import lands:
 
 ```
-farcry2.exe      44 imports |   44 implemented |   0 loud traps |   0 abort stubs
-Dunia.dll       602 imports |  567 implemented |  35 loud traps |   0 abort stubs
-binkw32.dll      91 imports |   91 implemented |   0 loud traps |   0 abort stubs
+farcry2.exe            44 imports |   44 implemented |   0 loud traps |   0 abort stubs
+Dunia.dll             602 imports |  602 implemented |   0 loud traps |   0 abort stubs
+binkw32.dll            91 imports |   91 implemented |   0 loud traps |   0 abort stubs
+systemdetection.dll   140 imports |  140 implemented |   0 loud traps |   0 abort stubs
 ```
 
-Every import of all three modules resolves to either an implementation or a
-deliberate loud trap. The 35 traps are the MSVCP80 iostream/stringstream entry
-points, kept as `NULL` on purpose so the first call stops at one identifiable
-mangled name.
+Every import of all four modules resolves to an implementation. The 35
+MSVCP80 iostream/stringstream entry points that used to be deliberate loud
+traps are implemented now (see §9); a call into an entry point *outside* that
+subset still stops at one identifiable mangled name rather than corrupting
+memory.
+
+Eight of the implementations are deliberate fallbacks: they log once and
+return a fixed failure value instead of pretending to work —
+`UpdateLayeredWindow`, `WSAStartup`, `socket`, `gethostbyname`,
+`AcquireCredentialsHandleA`, `CryptGenRandom`, `EnumDisplayDevicesA` and
+`EAXDirectSoundCreate8`.
+
+Ordinal imports matter here: `pefile` silently resolves them to names through its
+built-in `ordlookup` tables, which hides them from a name-only comparison. The
+checker reads the ordinal out of the import table instead. The engine imports
+`WS2_32` by ordinal (30 entries), plus `OLEAUT32` `#8`/`#9`, `XINPUT1_3`
+`#2`/`#3`, `DSOUND` `#11`/`#2` and `EAX` `#6`; the runtime registers those shims
+under `#<ordinal>` as well.
 
 
 `crt_shims.c` registers its table under both `msvcr71.dll` (the reference ports)
@@ -268,8 +308,10 @@ Windows path (`C:\FarCry2\bin\farcry2.exe`), not a hard-coded "USM.exe".
 | `Dunia.dll` | 14,125,334 | **82,403** | 857 | 1,512 | 6,423 | 724 s | 2,075 MB |
 | `binkw32.dll` | 6,316 (plus the `BINK*` sections) | 447 | 14 | 42 | — | seconds | — |
 | `farcry2.exe` | 2,584 | 52 | 0 | 0 | 0 | <1 s | — |
+| `systemdetection.dll` | 179,264 | **1,299** | 46 | 11 | 368 | seconds | — |
 
-Dunia's discovery reached **95.5 %** of the code bytes.
+Dunia's discovery reached **95.5 %** of the code bytes; `systemdetection.dll`
+reached 173,534 of 179,264 bytes (**96.8 %**).
 
 The 4.5 % of Dunia not covered is code reachable only through the 1,512
 unresolved indirect jumps (C++ virtual calls through tables the analyser cannot
@@ -282,9 +324,18 @@ abort stub with its address, which is how the next gap gets identified.
 | Image | Lifted | Rejected | Output |
 |---|---|---|---|
 | `Dunia.dll` | **82,149** | 254 | 384 files |
-| `farcry2.exe` | **52** | 0 | 16 files (14 non-empty) |
 | `binkw32.dll` | **442** | 5 | 24 files |
-| **total** | **82,643** | **259** | **427 C files, 283 MB** |
+| `systemdetection.dll` | **1,297** | 2 | 24 files |
+| `farcry2.exe` | **52** | 0 | 256 files (46 non-empty) |
+| **total** | **83,940** | **261** | **688 files + 4 tables, 288 MB** |
+
+Files are address buckets (`LIFT_FILES`, default 24, 64 for an exe): the count
+keeps a per-file compile short while keeping a re-lift of one address range
+local. `farcry2.exe`'s 52 functions are spread over the whole `.text`, so most
+of its 256 buckets end up empty (they compile to nothing).
+
+`gen/` therefore holds 692 `.c` files (688 lifted + one `*_table.c` per module)
+plus the four `funcs_*.h`, and is the single input the Android build globs.
 
 Rejection reasons (unsupported x86 encodings, mostly junk bytes inside
 functions that the analyser over-approximated):
@@ -309,12 +360,12 @@ no entry, so a call aborts by address rather than jumping into nothing.
 | Gap | Evidence / effect |
 |---|---|
 | **SEH / C++ exceptions** | `Dunia.dll` imports `_except_handler3`, `_except_handler4_common`, `__CxxFrameHandler3`, `_CxxThrowException`, `_setjmp3`/`longjmp`. `fc2_shims.c` traps the handlers with `rt_fatal`; the first real exception stops the game. **Top blocker.** |
-| **MSVCP80 iostreams** | 35 iostream/stringstream entry points are registered as `NULL`; the first call aborts with its mangled name. `basic_string`, `char_traits` and `std::exception` do work. |
+| **MSVCP80 iostreams** | the iostream/stringstream subset the engine uses is implemented (`GStream`, see §9), as are `basic_string`, `char_traits` and `std::exception`. Entry points outside that subset are still loud traps: they abort with their mangled name instead of corrupting memory. |
 | **No network** | Winsock/WinHTTP/WinINet/Secur32/Crypt32 are offline stubs. |
 | **DXT mips** | `D3DXFilterTexture` builds levels without filtering (logged). |
 | **In-memory texture save** | `D3DXSaveTextureToFileInMemory` → `E_NOTIMPL`. |
-| **Indirect-jump coverage** | 1,512 unresolved targets in Dunia; a call into one aborts at its address. |
-| **All other imports** | resolved: `tools/import_coverage.py` reports 0 unregistered imports across the three modules (see §9). |
+| **Indirect-jump coverage** | 1,512 unresolved targets in Dunia; a call into one aborts at its address. `binkw32.dll` 42, `systemdetection.dll` 11. |
+| **All other imports** | resolved: `tools/import_coverage.py` reports 0 unregistered imports across the four modules (see §9). |
 | **Unverified code** | Nothing has run on a device yet; see `docs/TESTED.md`. |
 
 ## 12. Commands used
