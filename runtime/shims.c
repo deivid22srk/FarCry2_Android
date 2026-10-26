@@ -5,9 +5,14 @@
 #include <strings.h>
 
 #define MAX_DEFS 2048
+/* Cache keys are "dll!name", and MSVC's mangled C++ import names run long
+ * (the longest in Dunia.dll is 140 bytes).  Truncating one silently turns the
+ * matching shim into an abort stub, so the buffers get real headroom and
+ * rt_import() says so if even these are not enough. */
+#define IMP_KEY 1024
 static const ShimDef *g_defs[MAX_DEFS];
 static int g_ndefs;
-static struct { char key[128]; uint32_t thunk; } g_imports[MAX_DEFS];
+static struct { char key[IMP_KEY]; uint32_t thunk; } g_imports[MAX_DEFS];
 static int g_nimports;
 
 void rt_register_shims(const ShimDef *defs) {
@@ -53,14 +58,20 @@ static ShimFn find_shim(const char *want, const char *name) {
 /* Data imports (variables) and exports of recompiled DLLs resolve to plain
  * guest addresses rather than thunks. */
 #define MAX_ADDRS 4096
-static struct { char key[128]; uint32_t addr; } g_addrs[MAX_ADDRS];
+static struct { char key[IMP_KEY]; uint32_t addr; } g_addrs[MAX_ADDRS];
 static int g_naddrs;
+
+/* "dll!name" cache key, with a hard failure rather than a silent truncation. */
+static void key_build(char *out, const char *want, const char *name) {
+    int n = snprintf(out, IMP_KEY, "%s!%s", want, name);
+    if (n >= IMP_KEY) rt_fatal("import name too long (%d bytes): %s", n, name);
+}
 
 void rt_register_data(const char *dll, const char *name, uint32_t addr) {
     char want[64];
     dll_base(dll, want, sizeof want);
     if (g_naddrs >= MAX_ADDRS) rt_fatal("too many data imports");
-    snprintf(g_addrs[g_naddrs].key, sizeof g_addrs[0].key, "%s!%s", want, name);
+    key_build(g_addrs[g_naddrs].key, want, name);
     g_addrs[g_naddrs++].addr = addr;
 }
 
@@ -68,8 +79,8 @@ void rt_register_data(const char *dll, const char *name, uint32_t addr) {
 uint32_t rt_import_opt(const char *dll, const char *name) {
     char want[64];
     dll_base(dll, want, sizeof want);
-    char key[128];
-    snprintf(key, sizeof key, "%s!%s", want, name);
+    char key[IMP_KEY];
+    key_build(key, want, name);
     for (int i = 0; i < g_naddrs; i++)
         if (!strcasecmp(g_addrs[i].key, key)) return g_addrs[i].addr;
     if (!find_shim(want, name)) return 0;
@@ -77,9 +88,9 @@ uint32_t rt_import_opt(const char *dll, const char *name) {
 }
 
 uint32_t rt_import(const char *dll, const char *name) {
-    char want[64], have[64], key[128];
+    char want[64], have[64], key[IMP_KEY];
     dll_base(dll, want, sizeof want);
-    snprintf(key, sizeof key, "%s!%s", want, name);
+    key_build(key, want, name);
     for (int i = 0; i < g_naddrs; i++)
         if (!strcasecmp(g_addrs[i].key, key)) return g_addrs[i].addr;
     for (int i = 0; i < g_nimports; i++)

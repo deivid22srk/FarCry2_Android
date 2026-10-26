@@ -7,11 +7,13 @@
  *      msvcrt table (runtime/msvcrt.c + runtime/crt_shims.c); this file adds
  *      the VC8 entry points that table does not have.
  *   2. MSVCP80.dll - the VC8 C++ library. std::basic_string<char/wchar_t> and
- *      char_traits are implemented against the documented VC8 layout
- *      (16-byte inline buffer, size, capacity). The iostream/stringstream
- *      entry points are NOT implemented: they fail loudly with their mangled
- *      name, so a run that needs them stops at one identifiable import instead
- *      of corrupting memory. See docs/RECON.md, "Known gaps".
+ *      char_traits are implemented against the documented VC8 layout (16-byte
+ *      inline buffer, size, capacity), and so is the iostream/stringstream
+ *      subset Far Cry 2 uses (GStream: a file-backed streambuf plus the
+ *      operator<< / operator>> / getline entry points it reaches). Anything
+ *      outside that subset still fails loudly with its mangled name, so a run
+ *      that needs it stops at one identifiable import instead of corrupting
+ *      memory. See docs/RECON.md, "Known gaps".
  *   3. Win32 APIs the shared runtime lacks: Winsock/WinHTTP/WinINet (no
  *      network), gdiplus, dbghelp, EAX, Secur32/Crypt32 (online only), named
  *      pipes, PSAPI, IP Helper.
@@ -22,6 +24,8 @@
  */
 #define _GNU_SOURCE
 #include "rt.h"
+#include "hcom.h"   /* guest COM objects (IStream, GpBitmap) */
+#include "art.h"    /* png_decode for the GDI+ image path */
 #include <ctype.h>
 #include <errno.h>
 #include <string.h>
@@ -35,6 +39,8 @@
 #include <sys/stat.h>
 
 void msvcrt_register_as_msvcr80(void);
+
+#define THIS c->r[1] /* ecx: the this pointer of a __thiscall member */
 
 /* once-per-import logging keeps a 60 fps failure path from filling log.txt */
 static char g_once_seen[64][72];
@@ -138,8 +144,19 @@ SHIM(rename) { RETC(rename(GSTR(ARG(0)), GSTR(ARG(1)))); }
 SHIM(remove) { RETC(remove(GSTR(ARG(0)))); }
 SHIM(_time64) { RETC((uint32_t)time(NULL)); }
 SHIM(_utime64) { RETC(0); }
-SHIM(_localtime64) { RETC((uint32_t)(uintptr_t)localtime((const time_t *)GPTR(ARG(0))) - (uint32_t)(uintptr_t)MEM); }
-SHIM(_gmtime64) { RETC((uint32_t)(uintptr_t)gmtime((const time_t *)GPTR(ARG(0))) - (uint32_t)(uintptr_t)MEM); }
+/* The `ptr - MEM` idiom only produces a valid guest address when the pointer
+ * already points into guest memory.  For the few CRT calls that return
+ * pointers into host-side statics (struct tm, strerror's table) the result has
+ * to be copied into guest memory instead. */
+static uint32_t g_tm_g;
+static uint32_t tm_to_guest(const struct tm *t) {
+    if (!t) return 0;
+    if (!g_tm_g) g_tm_g = gmalloc(64);
+    memcpy(MEM + g_tm_g, t, 36); /* VC8 struct tm: 9 ints */
+    return g_tm_g;
+}
+SHIM(_localtime64) { RETC(tm_to_guest(localtime((const time_t *)GPTR(ARG(0))))); }
+SHIM(_gmtime64) { RETC(tm_to_guest(gmtime((const time_t *)GPTR(ARG(0))))); }
 SHIM(_mktime64) { RETC((uint32_t)mktime((struct tm *)GPTR(ARG(0)))); }
 SHIM(_localtime64_s) { RETC(0); }
 SHIM(_difftime64) { RETC((uint32_t)(int32_t)difftime((time_t)ARG(0), (time_t)ARG(1))); }
@@ -151,7 +168,13 @@ SHIM(strpbrk) { RETC((uint32_t)(uintptr_t)strpbrk(GSTR(ARG(0)), GSTR(ARG(1))) - 
 SHIM(strcspn) { RETC((uint32_t)strcspn(GSTR(ARG(0)), GSTR(ARG(1)))); }
 SHIM(strcoll) { RETC(strcoll(GSTR(ARG(0)), GSTR(ARG(1)))); }
 SHIM(printf) { RETC(0); }
-SHIM(strerror) { RETC((uint32_t)(uintptr_t)strerror(ARG(0)) - (uint32_t)(uintptr_t)MEM); }
+SHIM(strerror) {
+    static uint32_t g;
+    const char *s = strerror(ARG(0));
+    if (!g) g = gmalloc(160);
+    snprintf((char *)MEM + g, 160, "%s", s ? s : "");
+    RETC(g);
+}
 
 /* _s variants: the destination-size check is real, the rest forwards. */
 static uint32_t safe_copy(void *dst, size_t dstsz, const void *src, size_t n) {
@@ -203,7 +226,7 @@ SHIM(__CppXcptFilter) { RETC(1); }       /* EXCEPTION_CONTINUE_SEARCH */
 SHIM(_crt_debugger_hook) { RETC(0); }
 SHIM(_invalid_parameter_noinfo) { RETC(0); }
 SHIM(__clean_type_info_names_internal) { RETC(0); }
-SHIM(type_info_dtor_internal) { RET(0, 1); }
+SHIM(type_info_dtor_internal) { RET(0, 0); } /* ?_type_info_dtor_internal_method@type_info@@QAEXXZ */
 SHIM(_initterm_e) {
     for (uint32_t p = ARG(0); p < ARG(1); p += 4) {
         uint32_t fn = M32(p);
@@ -212,44 +235,58 @@ SHIM(_initterm_e) {
     RETC(0);
 }
 
-/* _beginthreadex: same guest-thread machinery as CreateThread, different
- * return convention (uintptr_t handle, 0 on failure). */
-typedef struct { uint32_t start, arg; } BThread;
-static void *bthread_main(void *p) {
-    BThread *t = p;
-    CPU *cpu = rt_new_cpu();
-    rt_thread_init(cpu);
-    uint32_t a[1] = {t->arg};
-    rt_invoke(cpu, t->start, 1, a);
-    free(t);
-    return NULL;
-}
+/* _beginthreadex: the CRT's thread entry.  Same guest-thread machinery and
+ * handle table as CreateThread (the engine waits on and resumes the handle it
+ * gets back), different return convention (uintptr_t handle, 0 on failure). */
 SHIM(_beginthreadex) {
-    BThread *t = calloc(1, sizeof *t);
-    t->start = ARG(2);
-    t->arg = ARG(3);
-    pthread_t pt;
-    if (pthread_create(&pt, NULL, bthread_main, t)) { free(t); RETC(0); }
-    pthread_detach(pt);
-    if (ARG(5)) M32(ARG(5)) = (uint32_t)(uintptr_t)pt;
-    RETC((uint32_t)(uintptr_t)pt);
+    uint32_t tid = 0;
+    uint32_t h = rt_thread_create(ARG(2), ARG(3), ARG(4), &tid);
+    if (ARG(5)) M32(ARG(5)) = tid;
+    RETC(h);
 }
+/* _endthreadex: ends the calling thread.  The runtime already terminates the
+ * thread slot when the start routine returns, so unwinding to that is enough;
+ * not returning would leave no way back. */
+SHIM(_endthreadex) { RETC(0); }
 
 /* ==================================================================== */
 /* MSVCP80: VC8 std::string ABI                                          */
 /* ==================================================================== */
-/* MSVC 8 layout, x86: union { char _Buf[16]; char *_Ptr; } _Bx; size_t
- * _Mysize; size_t _Myres. Inline when _Myres < 16 (8 for wchar_t),
- * otherwise _Bx is a guest heap pointer. */
-typedef struct { uint32_t bx; uint32_t pad[3]; uint32_t size, res; } Vc8Str;
+/* Far Cry 2's VC8 build lays basic_string out as
+ *
+ *   +0x00  _Alval / container proxy   (4 bytes; the engine stores its shared
+ *          empty-string sentinel 0x10F239D1 here)
+ *   +0x04  union { char _Buf[16]; char *_Ptr; char *_Alias[16]; } _Bx
+ *   +0x14  size_t _Mysize
+ *   +0x18  size_t _Myres              sizeof == 28
+ *
+ * i.e. _Bx is 4 bytes into the object, not at offset 0.  Verified against the
+ * engine's own inlined helpers: `cmp dword ptr [reg+0x18], 0x10` occurs 749
+ * times in Dunia (e.g. 0x10002750, 0x100492F0) and is followed by
+ * `mov edx,[reg+0x14]` (size) plus `mov eax,[reg+4]` (long) / `add eax,4`
+ * (inline), and Dunia's own std::string::assign at 0x10002D40 reads _Myres
+ * from [ecx+0x18] and takes `lea ebx,[ecx+4]` as the inline buffer.
+ *
+ * Inline when _Myres < 16 (8 for wchar_t), otherwise _Bx is a guest heap
+ * pointer. */
+typedef struct { uint32_t hdr; uint32_t bx; uint32_t pad[3]; uint32_t size, res; } Vc8Str;
+#define VC8_EMPTY 0x10F239D1u /* engine's shared empty-string sentinel */
 
-static char *vc8_ptr(Vc8Str *s) { return s->res >= 16 ? (char *)(uintptr_t)s->bx : (char *)s; }
-static wchar_t *vc8_wptr(Vc8Str *s) { return s->res >= 8 ? (wchar_t *)(uintptr_t)s->bx : (wchar_t *)s; }
+/* `res >= 16` means _Bx holds a *guest* offset; host code must add MEM to
+ * reach the bytes.  (It used to reinterpret the offset as a host pointer,
+ * which either read unmapped memory or, via the `ptr - MEM` idiom, handed the
+ * engine an address that was not the string at all.) */
+static char *vc8_ptr(Vc8Str *s) { return s->res >= 16 ? (char *)MEM + s->bx : (char *)&s->bx; }
+static wchar_t *vc8_wptr(Vc8Str *s) { return s->res >= 8 ? (wchar_t *)(MEM + s->bx) : (wchar_t *)&s->bx; }
+/* c_str() hands the engine a guest address. */
+static uint32_t vc8_data_g(Vc8Str *s) { return (uint32_t)((uint8_t *)vc8_ptr(s) - MEM); }
+static uint32_t vc8_wdata_g(Vc8Str *s) { return (uint32_t)((uint8_t *)vc8_wptr(s) - MEM); }
 static void vc8_set_c(Vc8Str *s, const char *p, uint32_t n) {
+    s->hdr = VC8_EMPTY;
     if (n < 16) {
         s->res = 15;
-        memcpy(s, p, n);
-        ((char *)s)[n] = 0;
+        memcpy(&s->bx, p, n);
+        ((char *)&s->bx)[n] = 0;
     } else {
         uint32_t d = gmalloc(n + 1);
         memcpy(MEM + d, p, n);
@@ -260,10 +297,11 @@ static void vc8_set_c(Vc8Str *s, const char *p, uint32_t n) {
     s->size = n;
 }
 static void vc8_set_w(Vc8Str *s, const wchar_t *p, uint32_t n) {
+    s->hdr = VC8_EMPTY;
     if (n < 8) {
         s->res = 7;
-        memcpy(s, p, 2 * n);
-        ((wchar_t *)s)[n] = 0;
+        memcpy(&s->bx, p, 2 * n);
+        ((wchar_t *)&s->bx)[n] = 0;
     } else {
         uint32_t d = gmalloc(2 * (n + 1));
         memcpy(MEM + d, p, 2 * n);
@@ -274,41 +312,47 @@ static void vc8_set_w(Vc8Str *s, const wchar_t *p, uint32_t n) {
     s->size = n;
 }
 
-/* thiscall: RET(v, nargs) leaves `this` for the caller, as MSVC ret N does. */
+/* thiscall: RET(v, nargs) leaves `this` for the caller, as MSVC ret N does.
+ * `this` is ecx (THIS); the stack arguments start at ARG(0) - these shims used
+ * to read ARG(0) as `this`, which is the return address. */
 SHIM(str_ctor_cstr) {
-    Vc8Str *s = GPTR(ARG(0));
-    const char *p = GSTR(ARG(1));
+    Vc8Str *s = GPTR(THIS);
+    const char *p = GSTR(ARG(0));
     vc8_set_c(s, p ? p : "", p ? (uint32_t)strlen(p) : 0);
     RET(0, 1);
 }
 SHIM(str_ctor_copy) {
-    Vc8Str *s = GPTR(ARG(0)), *o = GPTR(ARG(1));
-    vc8_set_c(s, vc8_ptr(o), o->size);
+    Vc8Str *s = GPTR(THIS), *o = GPTR(ARG(0));
+    vc8_set_c(s, o ? vc8_ptr(o) : "", o ? o->size : 0);
     RET(0, 1);
 }
 SHIM(str_dtor) {
-    Vc8Str *s = GPTR(ARG(0));
+    Vc8Str *s = GPTR(THIS);
+    if (!s) RET(0, 0);
     if (s->res >= 16) gfree(s->bx);
     s->res = 15;
     s->size = 0;
-    ((char *)s)[0] = 0;
+    s->hdr = VC8_EMPTY;
+    ((char *)&s->bx)[0] = 0;
     RET(0, 0);
 }
-SHIM(str_size) { RET(((Vc8Str *)GPTR(ARG(0)))->size, 0); }
-SHIM(str_c_str) { RET((uint32_t)(uintptr_t)vc8_ptr(GPTR(ARG(0))) - (uint32_t)(uintptr_t)MEM, 0); }
-SHIM(str_wc_str) { RET((uint32_t)(uintptr_t)vc8_wptr(GPTR(ARG(0))) - (uint32_t)(uintptr_t)MEM, 0); }
+SHIM(str_size) { Vc8Str *s = GPTR(THIS); RET(s ? s->size : 0, 0); }
+SHIM(str_c_str) { Vc8Str *s = GPTR(THIS); RET(s ? vc8_data_g(s) : 0, 0); }
+SHIM(str_wc_str) { Vc8Str *s = GPTR(THIS); RET(s ? vc8_wdata_g(s) : 0, 0); }
 SHIM(str_w_ctor_cstr) {
-    Vc8Str *s = GPTR(ARG(0));
-    const wchar_t *p = (const wchar_t *)GPTR(ARG(1));
+    Vc8Str *s = GPTR(THIS);
+    const wchar_t *p = (const wchar_t *)GPTR(ARG(0));
     vc8_set_w(s, p ? p : L"", p ? (uint32_t)wcslen(p) : 0);
     RET(0, 1);
 }
 SHIM(str_w_dtor) {
-    Vc8Str *s = GPTR(ARG(0));
+    Vc8Str *s = GPTR(THIS);
+    if (!s) RET(0, 0);
     if (s->res >= 8) gfree(s->bx);
     s->res = 7;
     s->size = 0;
-    ((wchar_t *)s)[0] = 0;
+    s->hdr = VC8_EMPTY;
+    ((wchar_t *)&s->bx)[0] = 0;
     RET(0, 0);
 }
 
@@ -356,17 +400,303 @@ SHIM(tr_move_s) {
 SHIM(tr_xlen) { rt_fatal("std::string length_error (_Xlen) reached"); }
 SHIM(tr_xran) { rt_fatal("std::string out_of_range (_Xran) reached"); }
 
-/* ios_base / basic_ios (thiscall) */
-SHIM(ios_good) { RET(M32(ARG(0) + 4) == 0, 0); }
-SHIM(ios_flags) { RET(M32(ARG(0) + 0x10), 0); }
-SHIM(ios_width_get) { RET(M32(ARG(0) + 0x0C), 0); }
+/* ==================================================================== */
+/* MSVCP80: VC8 iostream / stringstream subset                           */
+/* ==================================================================== */
+/* Dunia uses basic_ostringstream<char>, basic_istringstream<char> and
+ * basic_stringstream<wchar_t> only through out-of-line MSVCP80 entry
+ * points (the rest of the stream machinery is inlined into Dunia).  Rather
+ * than guess MSVC's stream object layout, the contents live on the host,
+ * keyed by the guest address the constructor was handed, so the guest
+ * object layout never has to match MSVC's.
+ *
+ * A handful of entry points (ios_base::width/flags, basic_ios::rdbuf/tie/
+ * setstate/clear, basic_streambuf::sputc/sputn) are reached through the
+ * virtual-base adjustor - the engine does `mov ecx,[obj] ; mov ecx,[ecx+4]
+ * ; add ecx,obj` - so their `this` is a small constant offset from the
+ * stream object.  Lookup therefore falls back to the nearest live stream
+ * within +/-0x800 bytes.  basic_ios::rdbuf returns the stream's own key, so
+ * a subsequent sputc/sputn through it maps back exactly. */
+#define GSTREAM_MAX 96
+typedef struct {
+    int used, wide;
+    uint32_t self;
+    char *c; uint32_t cn, cc;       /* narrow contents */
+    uint16_t *w; uint32_t wn, wc;   /* wide contents */
+    uint32_t rdpos;                 /* istringstream read position */
+    int32_t width, flags;
+    uint16_t fill;
+    int good;
+} GStream;
+static GStream g_streams[GSTREAM_MAX];
+static uint32_t g_stream_rotor;
+
+
+static void st_reset(GStream *s) {
+    if (s->c) { free(s->c); s->c = NULL; }
+    if (s->w) { free(s->w); s->w = NULL; }
+    memset(s, 0, sizeof *s);
+}
+static GStream *st_exact(uint32_t self) {
+    for (int i = 0; i < GSTREAM_MAX; i++)
+        if (g_streams[i].used && g_streams[i].self == self) return &g_streams[i];
+    return NULL;
+}
+static GStream *st_find(uint32_t self) {
+    GStream *best = NULL;
+    uint32_t bd = 0x801;
+    for (int i = 0; i < GSTREAM_MAX; i++) {
+        uint32_t d;
+        if (!g_streams[i].used) continue;
+        d = self > g_streams[i].self ? self - g_streams[i].self : g_streams[i].self - self;
+        if (d < bd) { bd = d; best = &g_streams[i]; }
+    }
+    return best;
+}
+static GStream *st_open(uint32_t self, int wide) {
+    GStream *s = st_exact(self);
+    if (s) st_reset(s);
+    else {
+        for (int i = 0; i < GSTREAM_MAX; i++)
+            if (!g_streams[i].used) { s = &g_streams[i]; break; }
+        if (!s) { s = &g_streams[g_stream_rotor++ % GSTREAM_MAX]; st_reset(s); }
+    }
+    memset(s, 0, sizeof *s);
+    s->used = 1; s->self = self; s->wide = wide;
+    s->flags = 0x0201; /* skipws | dec, the VC8 default */
+    s->fill = ' ';
+    s->good = 1;
+    return s;
+}
+/* MSVCP80's constructor would have set the object's vftable pointer at [+0]
+ * and its virtual-base pointer at [+4].  Dunia also contains inlined library
+ * code that reads those two fields directly, e.g. 0x1021425D:
+ *     mov ecx,[esi+4]      ; vbptr
+ *     mov edx,[ecx+4]      ; offset of the ios_base virtual base
+ *     lea ecx,[edx+esi+4]  ; &ios_base   -> ?clear / ?width / ...
+ * With [+4] left zero that walk faults on guest address 4.  Any small positive
+ * offset works: every basic_ios/ios_base/ostream entry point is one of our
+ * shims and they find the stream by proximity.  The vftable's slots all point
+ * at a logging stub so a virtual call the engine happens to make inlined is
+ * reported rather than jumping to address 0. */
+SHIM(st_vcall) {
+    once("MSVCP80 stream virtual call (absorbed - see st_obj_init)");
+    RET(0, 0);
+}
+static uint32_t st_vtable_g, st_vbtable_g;
+static void st_obj_init(uint32_t self) {
+    if (!st_vtable_g) {
+        uint32_t stub = rt_thunk(shim_st_vcall, "MSVCP80 stream virtual call");
+        st_vbtable_g = gmalloc(8);
+        if (st_vbtable_g) { M32(st_vbtable_g) = 0; M32(st_vbtable_g + 4) = 0x0c; }
+        st_vtable_g = gmalloc(8 + 16 * 4);
+        if (st_vtable_g) {
+            uint32_t vt = st_vtable_g + 4;   /* RTTI slot (used by dynamic_cast) at -4 */
+            M32(st_vtable_g) = 0;
+            for (int i = 0; i < 16; i++) M32(vt + 4 * i) = stub;
+            st_vtable_g = vt;
+        }
+    }
+    if (st_vtable_g && self) M32(self) = st_vtable_g;
+    if (st_vbtable_g && self) M32(self + 4) = st_vbtable_g;
+}
+static void st_close(uint32_t self) {
+    GStream *s = st_exact(self);
+    if (s) st_reset(s);
+}
+
+static void st_rc(GStream *s, uint32_t need) {
+    if (s->cc < need) {
+        uint32_t nc = s->cc ? s->cc : 32;
+        while (nc < need) nc *= 2;
+        s->c = realloc(s->c, nc);
+        s->cc = nc;
+    }
+}
+static void st_rw(GStream *s, uint32_t need) {
+    if (s->wc < need) {
+        uint32_t nc = s->wc ? s->wc : 32;
+        while (nc < need) nc *= 2;
+        s->w = realloc(s->w, 2 * nc);
+        s->wc = nc;
+    }
+}
+static void st_putc(GStream *s, int ch) {
+    if (s->wide) { st_rw(s, s->wn + 1); s->w[s->wn++] = (uint16_t)ch; }
+    else { st_rc(s, s->cn + 1); s->c[s->cn++] = (char)ch; }
+}
+static void st_write(GStream *s, const void *p, uint32_t n) {
+    if (!n || !p) return;
+    if (s->wide) {
+        st_rw(s, s->wn + n);
+        for (uint32_t i = 0; i < n; i++) s->w[s->wn + i] = ((const uint16_t *)p)[i];
+        s->wn += n;
+    } else {
+        st_rc(s, s->cn + n);
+        memcpy(s->c + s->cn, p, n);
+        s->cn += n;
+    }
+}
+/* Integer insertion honouring the base/width/fill the engine set through
+ * ios_base (fmtflags: showbase 0x8, showpos 0x20, left 0x40, dec/oct/hex
+ * in 0x0E00, uppercase 0x4). */
+static void st_num(GStream *s, uint64_t v, int neg) {
+    char buf[80], tmp[80];
+    int n = 0, base = 10, i;
+    const char *digs = "0123456789abcdef";
+    int32_t w, pad;
+    if ((s->flags & 0x0E00) == 0x0800) base = 16;
+    else if ((s->flags & 0x0E00) == 0x0400) base = 8;
+    if ((s->flags & 0x0004) && base == 16) digs = "0123456789ABCDEF";
+    if (!v) buf[n++] = '0';
+    while (v) { buf[n++] = digs[v % base]; v /= base; }
+    if (neg) buf[n++] = '-';
+    else if (s->flags & 0x0020) buf[n++] = '+';
+    if ((s->flags & 0x0008) && base == 16) { buf[n++] = (digs[10] == 'a') ? 'x' : 'X'; buf[n++] = '0'; }
+    for (i = 0; i < n; i++) tmp[i] = buf[n - 1 - i];
+    w = s->width;
+    pad = (w > n) ? w - n : 0;
+    if (!(s->flags & 0x0040))
+        while (pad-- > 0) st_putc(s, s->fill);
+    st_write(s, tmp, (uint32_t)n);
+    pad = (w > n) ? w - n : 0;
+    if (s->flags & 0x0040)
+        while (pad-- > 0) st_putc(s, s->fill);
+    s->width = 0; /* width resets after every insertion */
+}
+/* Copy the host contents into a guest basic_string (VC8 layout above). */
+static void st_to_str(GStream *s, uint32_t dst) {
+    Vc8Str *o = GPTR(dst);
+    if (!o) return;
+    if (s && s->wide) {
+        uint32_t n = s->wn, i;
+        if (n < 8) {
+            o->res = 7;
+            for (i = 0; i < n; i++) ((uint16_t *)&o->bx)[i] = s->w[i];
+            ((uint16_t *)&o->bx)[n] = 0;
+        } else {
+            uint32_t d = gmalloc(2 * (n + 1));
+            for (i = 0; i < n; i++) M16(d + 2 * i) = s->w[i];
+            M16(d + 2 * n) = 0;
+            o->bx = d;
+            o->res = n;
+        }
+        o->size = n;
+    } else {
+        uint32_t n = s ? s->cn : 0;
+        vc8_set_c(o, (s && s->c) ? s->c : "", n);
+    }
+    o->hdr = VC8_EMPTY;
+}
+
+/* ---- constructors / destructors ------------------------------------- */
+/* The engine pushes two dwords to the ostringstream/stringstream ctor and
+ * three to the istringstream ctor (both extra arguments are ignored). */
+SHIM(io_os_ctor) { st_obj_init(THIS); st_open(THIS, 0); RET(THIS, 2); }
+SHIM(io_ws_ctor) { st_obj_init(THIS); st_open(THIS, 1); RET(THIS, 2); }
+SHIM(io_is_ctor) {
+    GStream *s;
+    st_obj_init(THIS);
+    s = st_open(THIS, 0);
+    Vc8Str *v = GPTR(ARG(0));
+    if (v) st_write(s, vc8_ptr(v), v->size);
+    RET(THIS, 3);
+}
+SHIM(io_os_dtor) { st_close(THIS); RET(0, 0); }
+SHIM(io_ws_dtor) { st_close(THIS); RET(0, 0); }
+SHIM(io_is_dtor) { st_close(THIS); RET(0, 0); }
+
+/* ---- ?str (returns basic_string by value through a hidden pointer) --- */
+SHIM(io_os_str_get) { st_to_str(st_find(THIS), ARG(0)); RET(ARG(0), 1); }
+SHIM(io_ws_str_get) { st_to_str(st_find(THIS), ARG(0)); RET(ARG(0), 1); }
+SHIM(io_os_str_set) {
+    GStream *s = st_open(THIS, 0);
+    Vc8Str *v = GPTR(ARG(0));
+    if (v) st_write(s, vc8_ptr(v), v->size);
+    RET(0, 1);
+}
+
+/* ---- insertions ----------------------------------------------------- */
+SHIM(io_os_putk) { GStream *s = st_find(THIS); if (s) st_num(s, ARG(0), 0); RET(THIS, 1); }
+SHIM(io_os_putg) { GStream *s = st_find(THIS); if (s) st_num(s, ARG(0) & 0xFFFFu, 0); RET(THIS, 1); }
+SHIM(io_ws_putk) { GStream *s = st_find(THIS); if (s) st_num(s, ARG(0), 0); RET(THIS, 1); }
+SHIM(io_ws_putj) {
+    GStream *s = st_find(THIS);
+    int32_t v = (int32_t)ARG(0);
+    if (s) {
+        if (v < 0) st_num(s, (uint64_t)(-(int64_t)v), 1);
+        else st_num(s, (uint64_t)v, 0);
+    }
+    RET(THIS, 1);
+}
+SHIM(io_os_putmanip) {
+    static uint32_t endl_thunk;
+    GStream *s;
+    if (!endl_thunk)
+        endl_thunk = rt_import("msvcp80.dll",
+                               "?endl@std@@YAAAV?$basic_ostream@DU?$char_traits@D@std@@@1@AAV21@@Z");
+    s = st_find(THIS);
+    if (s && (ARG(0) == endl_thunk || ARG(0) == 0x10D7A334u)) st_putc(s, '\n');
+    RET(THIS, 1);
+}
+SHIM(io_endl) { /* std::endl, __cdecl */
+    GStream *s = st_find(ARG(0));
+    if (s) st_putc(s, '\n');
+    RETC(ARG(0));
+}
+SHIM(io_put_str) { /* operator<<(ostream&, const basic_string&), __cdecl */
+    GStream *s = st_find(ARG(0));
+    Vc8Str *v = GPTR(ARG(1));
+    if (s && v) st_write(s, vc8_ptr(v), v->size);
+    RETC(ARG(0));
+}
+
+/* ---- stream / ios_base plumbing (mostly no-ops) --------------------- */
+SHIM(io_flush) { RET(THIS, 0); }
+SHIM(io_wflush) { RET(THIS, 0); }
+SHIM(io_osfx) { RET(0, 0); }
+SHIM(io_wosfx) { RET(0, 0); }
+SHIM(io_lock) { RET(0, 0); }
+SHIM(io_unlock) { RET(0, 0); }
+SHIM(io_wlock) { RET(0, 0); }
+SHIM(io_wunlock) { RET(0, 0); }
+SHIM(io_rdbuf) { GStream *s = st_find(THIS); RET(s ? s->self : 0, 0); }
+SHIM(io_wrdbuf) { GStream *s = st_find(THIS); RET(s ? s->self : 0, 0); }
+SHIM(io_tie) { RET(0, 0); }
+SHIM(io_wtie) { RET(0, 0); }
+SHIM(io_setstate) { GStream *s = st_find(THIS); if (s) s->good = (ARG(0) == 0); RET(0, 2); }
+SHIM(io_wsetstate) { GStream *s = st_find(THIS); if (s) s->good = (ARG(0) == 0); RET(0, 2); }
+SHIM(io_putc) { GStream *s = st_find(THIS); if (s) st_putc(s, (int)(int8_t)ARG(0)); RET(ARG(0), 1); }
+SHIM(io_wputc) { GStream *s = st_find(THIS); if (s) st_putc(s, ARG(0) & 0xFFFFu); RET(ARG(0), 1); }
+SHIM(io_putn) { GStream *s = st_find(THIS); if (s) st_write(s, GPTR(ARG(0)), ARG(1)); RET(ARG(1), 2); }
+SHIM(io_wputn) { GStream *s = st_find(THIS); if (s) st_write(s, GPTR(ARG(0)), ARG(1)); RET(ARG(1), 2); }
+SHIM(io_fill) { GStream *s = st_find(THIS); RET(s ? s->fill : ' ', 0); }
+SHIM(io_is_getk) { /* istream& operator>>(unsigned long&) */
+    GStream *s = st_find(THIS);
+    uint32_t v = 0;
+    if (s && !s->wide) {
+        while (s->rdpos < s->cn && (s->c[s->rdpos] == ' ' || s->c[s->rdpos] == '\t')) s->rdpos++;
+        while (s->rdpos < s->cn && s->c[s->rdpos] >= '0' && s->c[s->rdpos] <= '9')
+            v = v * 10 + (uint32_t)(s->c[s->rdpos++] - '0');
+    }
+    if (ARG(0)) M32(ARG(0)) = v;
+    RET(THIS, 1);
+}
+
+/* ios_base / basic_ios (thiscall).  `this` is the sub-object the engine
+ * reaches through the virtual-base adjustor. */
+SHIM(ios_good) { GStream *s = st_find(THIS); RET(s ? (uint32_t)(s->good != 0) : 1u, 0); }
+SHIM(ios_flags) { GStream *s = st_find(THIS); RET(s ? (uint32_t)s->flags : 0x201u, 0); }
+SHIM(ios_width_get) { GStream *s = st_find(THIS); RET(s ? (uint32_t)s->width : 0u, 0); }
 SHIM(ios_width_set) {
-    uint32_t old = M32(ARG(0) + 0x0C);
-    M32(ARG(0) + 0x0C) = ARG(1);
+    GStream *s = st_find(THIS);
+    uint32_t old = s ? (uint32_t)s->width : 0u;
+    if (s) s->width = (int32_t)ARG(1);
     RET(old, 1);
 }
-SHIM(ios_setstate) { M32(ARG(0) + 4) |= ARG(1); RET(0, 2); }
-SHIM(ios_clear) { M32(ARG(0) + 4) = ARG(1); RET(0, 2); }
+SHIM(ios_setstate) { GStream *s = st_find(THIS); if (s) s->good = (ARG(1) == 0); RET(0, 2); }
+SHIM(ios_clear) { GStream *s = st_find(THIS); if (s) s->good = (ARG(0) == 0); RET(0, 2); }
+
 SHIM(num_epsilon) { RETXMMF(1.192092896e-07f); }
 SHIM(uncaught_exception) { RETC(0); }
 
@@ -398,14 +728,86 @@ SHIM(setsockopt) { RET(0xFFFFFFFFu, 5); }
 SHIM(getsockopt) { if (ARG(4)) M32(ARG(4)) = 0; RET(0xFFFFFFFFu, 5); }
 SHIM(ioctlsocket) { RET(0xFFFFFFFFu, 3); }
 SHIM(shutdown) { RET(0xFFFFFFFFu, 2); }
-SHIM(gethostbyname) { RET(0, 1); }
+SHIM(gethostbyname) {
+    /* Offline but *successful*: something has to resolve, or the engine's
+     * sockaddr_in::set() walk (inet_addr -> resolve -> inet_ntoa ->
+     * inet_addr) never terminates.  Answer with 127.0.0.1, which is what a
+     * loopback-only host would return. */
+    static uint32_t hostent_g, name_g, alias_g, list_g, addr_g;
+    if (!hostent_g) {
+        name_g = gmalloc(16);
+        memcpy(MEM + name_g, "localhost", 10);
+        alias_g = gmalloc(4);
+        M32(alias_g) = 0;
+        addr_g = gmalloc(4);
+        M32(addr_g) = 0x0100007Fu; /* 127.0.0.1, network order */
+        list_g = gmalloc(8);
+        M32(list_g) = addr_g;
+        M32(list_g + 4) = 0;
+        hostent_g = gmalloc(16);
+        M32(hostent_g + 0x00) = name_g;   /* h_name */
+        M32(hostent_g + 0x04) = alias_g;  /* h_aliases */
+        M16(hostent_g + 0x08) = 2;        /* h_addrtype = AF_INET */
+        M16(hostent_g + 0x0a) = 4;        /* h_length */
+        M32(hostent_g + 0x0c) = list_g;   /* h_addr_list */
+    }
+    once("WS2_32.gethostbyname (offline: resolves to 127.0.0.1)");
+    RET(hostent_g, 1);
+}
 SHIM(gethostbyaddr) { RET(0, 3); }
-SHIM(gethostname) { RET(0xFFFFFFFFu, 2); }
+SHIM(gethostname) {
+    const char *h = "localhost";
+    uint32_t buf = ARG(0), n = ARG(1);
+    if (buf && n) {
+        size_t cl = strlen(h);
+        if (cl > n - 1) cl = n - 1;
+        memcpy(MEM + buf, h, cl);
+        M8(buf + cl) = 0;
+    }
+    RET(0, 2);
+}
 SHIM(getaddrinfo) { RET(11001, 4); }            /* WSAHOST_NOT_FOUND */
 SHIM(freeaddrinfo) { RET(0, 1); }
 SHIM(getsockname) { RET(0xFFFFFFFFu, 3); }
-SHIM(inet_addr) { RET(0xFFFFFFFFu, 1); }
-SHIM(inet_ntoa) { RET((uint32_t)(uintptr_t)"0.0.0.0" - (uint32_t)(uintptr_t)MEM, 1); }
+/* Real dotted-quad parsing/formatting: stub versions made the engine's
+ * resolver loop forever (see gethostbyname above). */
+static uint32_t ipv4_parse(const char *s) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; i++) {
+        int n = 0, d = 0;
+        if (!isdigit((unsigned char)*s)) return 0xFFFFFFFFu;
+        while (isdigit((unsigned char)*s)) {
+            n = n * 10 + (*s - '0');
+            if (n > 255) return 0xFFFFFFFFu;
+            s++;
+            d++;
+        }
+        if (d > 3) return 0xFFFFFFFFu;
+        v |= (uint32_t)n << (8 * i);
+        if (i < 3) {
+            if (*s != '.') return 0xFFFFFFFFu;
+            s++;
+        }
+    }
+    if (*s) return 0xFFFFFFFFu;
+    return v;
+}
+static char g_ntoa_host[24];
+static uint32_t g_ntoa_g; /* guest copy handed to the engine */
+SHIM(inet_addr) {
+    const char *s = GSTR(ARG(0));
+    RET(s ? ipv4_parse(s) : 0xFFFFFFFFu, 1);
+}
+SHIM(inet_ntoa) {
+    uint32_t ip = ARG(0);
+    size_t n;
+    if (!g_ntoa_g) g_ntoa_g = gmalloc(24);
+    snprintf(g_ntoa_host, sizeof g_ntoa_host, "%u.%u.%u.%u", ip & 0xFFu, (ip >> 8) & 0xFFu,
+             (ip >> 16) & 0xFFu, (ip >> 24) & 0xFFu);
+    n = strlen(g_ntoa_host);
+    memcpy(MEM + g_ntoa_g, g_ntoa_host, n + 1);
+    RET(g_ntoa_g, 1);
+}
 SHIM(htonl) { RET(ARG(0), 1); }
 SHIM(htons) { RET(((ARG(0) & 0xFF) << 8) | ((ARG(0) >> 8) & 0xFF), 1); }
 SHIM(ntohl) { RET(ARG(0), 1); }
@@ -429,10 +831,12 @@ HTTP0(InternetSetCookieW, 3) HTTP0(InternetGetCookieW, 4)
 /* ---- TLS/SSL for online services: unsupported. ---- */
 #define SEC0(name, n) SHIM(name) { once("Secur32." #name " (online only)"); RET(0x80090304u, n); }
 SEC0(AcquireCredentialsHandleA, 9) SEC0(FreeCredentialsHandle, 1)
-SEC0(InitializeSecurityContextA, 9) SEC0(DeleteSecurityContext, 1)
+/* InitializeSecurityContextA takes 12 parameters; registering 9 left 12 bytes
+ * of arguments on the guest stack at every call. */
+SEC0(InitializeSecurityContextA, 12) SEC0(DeleteSecurityContext, 1)
 SEC0(QueryContextAttributesA, 3) SEC0(EncryptMessage, 4) SEC0(DecryptMessage, 4)
 SEC0(ApplyControlToken, 2) SEC0(FreeContextBuffer, 1)
-SHIM(CertGetCertificateChain) { RET(0, 9); }
+SHIM(CertGetCertificateChain) { RET(0, 8); }   /* 8 parameters, not 9 */
 SHIM(CertFreeCertificateChain) { RET(0, 1); }
 SHIM(CertFreeCertificateContext) { RET(1, 1); }
 SHIM(CertVerifyCertificateChainPolicy) { RET(0, 4); }
@@ -440,15 +844,43 @@ SHIM(CertVerifyCertificateChainPolicy) { RET(0, 4); }
 /* ---- Crypt32/Advapi hashing (online auth): accepts, returns fixed bytes. */
 SHIM(CryptAcquireContextA) { if (ARG(0)) M32(ARG(0)) = 1; RET(1, 5); }
 SHIM(CryptReleaseContext) { RET(1, 2); }
-SHIM(CryptCreateHash) { if (ARG(5)) M32(ARG(5)) = 2; RET(1, 6); }
+/* CryptCreateHash(hProv, Algid, hKey, dwFlags, phHash) - phHash is argument 4
+ * of 5; the old code wrote through argument 5, which is not part of the call. */
+SHIM(CryptCreateHash) { if (ARG(4)) M32(ARG(4)) = 2; RET(1, 5); }
 SHIM(CryptHashData) { RET(1, 4); }
-SHIM(CryptGetHashParam) { if (ARG(4)) M32(ARG(4)) = ARG(2); if (ARG(2)) memset(GPTR(ARG(2)), 0, ARG(3)); RET(1, 5); }
+/* CryptGetHashParam(hProv, dwParam, pbData, pdwDataLen, dwFlags): the caller
+ * passes its buffer size in *pdwDataLen, so report an empty result rather than
+ * clearing ARG(3) bytes starting at the stack slot that held the size. */
+SHIM(CryptGetHashParam) { if (ARG(3)) M32(ARG(3)) = 0; RET(1, 5); }
 SHIM(CryptDestroyHash) { RET(1, 1); }
-SHIM(CryptGenRandom) { if (ARG(2)) memset(GPTR(ARG(1)), 0x5A, ARG(2)); RET(1, 3); }
+/* CryptGenRandom(hProv, dwLen, pbBuffer): the buffer is the third parameter
+ * and the length the second - swapped here before, so the engine's memset of
+ * a 32-byte nonce wrote 500 MB at the stack address ARG(2) while reading the
+ * length from it.  Offline but functional: cheap pseudo-random bytes. */
+SHIM(CryptGenRandom) {
+    uint32_t len = ARG(1), buf = ARG(2);
+    uint8_t *p = GPTR(buf);
+    static uint32_t seed;
+    once("Advapi32.CryptGenRandom (offline: pseudo-random bytes)");
+    if (len > 0x100000u) len = 0x100000u;
+    if (!seed) seed = (uint32_t)time(NULL) | 1u;
+    if (p)
+        for (uint32_t i = 0; i < len; i++) {
+            seed = seed * 1103515245u + 12345u;
+            p[i] = (uint8_t)(seed >> 16);
+        }
+    RET(1, 3);
+}
 
 /* ---- IP Helper / PSAPI ---- */
 SHIM(GetAdaptersInfo) { if (ARG(1)) M32(ARG(1)) = 0; RET(232, 2); } /* ERROR_NO_DATA */
-SHIM(GetPerformanceInfo) { if (ARG(0)) memset(GPTR(ARG(0)), 0, 48); RET(1, 2); }
+SHIM(GetPerformanceInfo) {
+    /* PERFORMANCE_INFORMATION is 52 bytes on Win32; honour the caller's cb. */
+    uint32_t n = ARG(1);
+    if (n > 52) n = 52;
+    if (ARG(0)) memset(GPTR(ARG(0)), 0, n);
+    RET(1, 2);
+}
 
 /* ---- RPC ---- */
 SHIM(UuidToStringA) {
@@ -480,17 +912,205 @@ SHIM(CoCreateGuid) {
     }
     RET(0, 1);
 }
-SHIM(CreateStreamOnHGlobal) { RET(0x80004005u, 3); } /* E_FAIL */
+/* ---- ole32: a real in-memory IStream over an HGLOBAL -------------------- *
+ * The engine wraps its own image bytes in a stream and hands it to GDI+.
+ * Returning E_FAIL *without writing *ppstm* is what caused the first null
+ * dereference of a real run: the engine's caller initialises its IStream* to
+ * NULL, and after the failure it Releases it unguarded (guest 0x100063F6
+ * `mov ecx,[eax]` with eax = the untouched local), so the guest touched
+ * address 0.  The stream is therefore real: it reads the HGLOBAL through the
+ * same guest heap the engine allocated it from.
+ *
+ * HGLOBAL in this runtime *is* the guest pointer (GlobalLock returns it as
+ * is), so the size comes from gsize() and fDeleteOnRelease is honoured by
+ * leaving the block to the engine: the engine passes FALSE here and frees it
+ * with GlobalFree after the last Release. */
+typedef struct { uint32_t base, size, pos; } MemStream;
+static HComClass k_istream;
 
-/* ---- gdiplus: startup succeeds; image calls fail and the engine falls
- * back to its own drawing. ---- */
+static MemStream *ms_of(CPU *c) { return (MemStream *)hcom_host(ARG(0)); }
+
+SHIM(istream_QueryInterface) { hcom_addref(ARG(0)); if (ARG(2)) M32(ARG(2)) = ARG(0); RET(0, 3); }
+SHIM(istream_AddRef) { RET(hcom_addref(ARG(0)), 1); }
+SHIM(istream_Release) {
+    MemStream *m = ms_of(c);
+    uint32_t left;
+    int died = hcom_release(ARG(0), &left);
+    if (died) free(m);
+    RET(left, 1);
+}
+SHIM(istream_Read) {
+    MemStream *m = ms_of(c);
+    uint32_t pv = ARG(1), cb = ARG(2), pcb = ARG(3), n = 0;
+    if (m && pv && cb) {
+        n = m->size > m->pos ? m->size - m->pos : 0;
+        if (n > cb) n = cb;
+        if (n) memcpy(MEM + pv, MEM + m->base + m->pos, n);
+        m->pos += n;
+    }
+    if (pcb) M32(pcb) = n;
+    RET(0, 4);
+}
+SHIM(istream_Write) { if (ARG(3)) M32(ARG(3)) = 0; RET(E_NOTIMPL_, 4); }
+SHIM(istream_Seek) {   /* LARGE_INTEGER (2 dwords), DWORD, ULARGE_INTEGER* */
+    MemStream *m = ms_of(c);
+    int64_t move = (int64_t)((uint64_t)ARG(1) | (uint64_t)ARG(2) << 32), np = 0;
+    uint32_t origin = ARG(3), pnew = ARG(4);
+    if (m) {
+        if (origin == 0) np = move;
+        else if (origin == 1) np = (int64_t)m->pos + move;
+        else np = (int64_t)m->size + move;
+        if (np < 0) np = 0;
+        if (np > (int64_t)m->size) np = m->size;
+        m->pos = (uint32_t)np;
+    }
+    if (pnew) { M32(pnew) = (uint32_t)np; M32(pnew + 4) = (uint32_t)((uint64_t)np >> 32); }
+    RET(0, 5);
+}
+SHIM(istream_SetSize) { RET(E_NOTIMPL_, 3); }
+SHIM(istream_CopyTo) { RET(E_NOTIMPL_, 6); }
+SHIM(istream_Commit) { RET(0, 2); }
+SHIM(istream_Revert) { RET(E_NOTIMPL_, 1); }
+SHIM(istream_LockRegion) { RET(E_NOTIMPL_, 6); }
+SHIM(istream_UnlockRegion) { RET(E_NOTIMPL_, 6); }
+SHIM(istream_Stat) {   /* STATSTG: type at 4, cbSize at 8, grfMode at 0x28 */
+    MemStream *m = ms_of(c);
+    uint32_t p = ARG(1);
+    if (p) {
+        memset(MEM + p, 0, 0x48);
+        M32(p + 4) = 2;                                    /* STGTY_STREAM */
+        M32(p + 8) = m ? m->size : 0;
+        M32(p + 0x28) = 0;                                 /* STGM_READ */
+    }
+    RET(0, 3);
+}
+SHIM(istream_Clone) { RET(E_NOTIMPL_, 2); }
+
+SHIM(CreateStreamOnHGlobal) {
+    uint32_t h = ARG(0), del = ARG(1), out = ARG(2);
+    if (!out) RET(0x80070057u /* E_INVALIDARG */, 3);
+    MemStream *m = calloc(1, sizeof *m);
+    m->base = h;
+    m->size = h ? gsize(h) : 0;
+    m->pos = 0;
+    (void)del;   /* the engine owns the HGLOBAL (it passes FALSE) */
+    M32(out) = hcom_new(&k_istream, m);
+    LOG("ole32.CreateStreamOnHGlobal(%08x, delete=%u) -> %u bytes at %08x", h, del, m->size, M32(out));
+    RET(0, 3);
+}
+
+/* ---- gdiplus ------------------------------------------------------------ *
+ * Dunia gives GDI+ exactly one job at startup: an IStream of image bytes in,
+ * a GpBitmap out, then GdipCreateHBITMAPFromBitmap, and the HBITMAP only ever
+ * goes into this port's fake DCs (GDI here is a set of no-op handles, there is
+ * no BitBlt).  What matters is that every call hands back a *valid* object, so
+ * the engine never holds a NULL GpBitmap: the flat API's own status is
+ * returned, and the pixels are decoded when the format is recognised (BMP,
+ * PNG).  The engine only imports these eight entry points. */
+typedef struct { int w, h; uint8_t *px; } GpBitmap;
+static HComClass k_gpbitmap;
+
+SHIM(gpbitmap_vcall) { once("gdiplus GpBitmap vtable call (unexpected)"); RET(E_NOTIMPL_, 1); }
+
 SHIM(GdiplusStartup) { if (ARG(0)) M32(ARG(0)) = 1; RET(0, 3); }
 SHIM(GdiplusShutdown) { RET(0, 1); }
 SHIM(GdipAlloc) { RET(gmalloc(ARG(0)), 1); }
 SHIM(GdipFree) { gfree(ARG(0)); RET(0, 1); }
-#define GDIP_FAIL(name, n) SHIM(name) { once("gdiplus." #name " (image path unsupported)"); RET(0x80004005u, n); }
-GDIP_FAIL(GdipCloneImage, 4) GDIP_FAIL(GdipDisposeImage, 1)
-GDIP_FAIL(GdipCreateBitmapFromStream, 2) GDIP_FAIL(GdipCreateHBITMAPFromBitmap, 4)
+
+static uint32_t gdi16(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8; }
+static uint32_t gdi32(const uint8_t *p) {
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+/* 24/32-bit BI_RGB, bottom-up or top-down; NULL for anything else. */
+static uint8_t *bmp_decode(const uint8_t *b, size_t n, int *ow, int *oh) {
+    if (n < 54 || b[0] != 'B' || b[1] != 'M') return NULL;
+    uint32_t off = gdi32(b + 10);
+    int32_t w = (int32_t)gdi32(b + 18), h = (int32_t)gdi32(b + 22);
+    uint32_t bpp = gdi16(b + 28), comp = gdi32(b + 30);
+    int topdown = h < 0;
+    if (h < 0) h = -h;
+    if (w <= 0 || h <= 0 || comp != 0 || (bpp != 24 && bpp != 32)) return NULL;
+    uint32_t stride = ((uint32_t)w * bpp / 8 + 3) & ~3u;
+    if ((uint64_t)off + (uint64_t)stride * (uint32_t)h > n) return NULL;
+    uint8_t *out = malloc((size_t)w * h * 4);
+    if (!out) return NULL;
+    for (int y = 0; y < h; y++) {
+        const uint8_t *src = b + off + (size_t)stride * (topdown ? y : h - 1 - y);
+        uint8_t *dst = out + (size_t)y * w * 4;
+        for (int x = 0; x < w; x++) {
+            dst[0] = src[x * bpp / 8 + 2];
+            dst[1] = src[x * bpp / 8 + 1];
+            dst[2] = src[x * bpp / 8 + 0];
+            dst[3] = bpp == 32 ? src[x * 4 + 3] : 0xFF;
+        }
+    }
+    *ow = w;
+    *oh = h;
+    return out;
+}
+
+SHIM(GdipCreateBitmapFromStream) {
+    uint32_t st = ARG(0), out = ARG(1);
+    GpBitmap *gb = calloc(1, sizeof *gb);
+    gb->w = gb->h = 1;
+    gb->px = calloc(4, 1);
+    gb->px[0] = gb->px[1] = gb->px[2] = gb->px[3] = 0xFF;
+    uint32_t base = 0, size = 0;
+    if (st && M32(st) == k_istream.vtbl) {
+        MemStream *m = hcom_host(st);
+        if (m) { base = m->base; size = m->size; }
+    }
+    if (base && size) {
+        const uint8_t *bytes = MEM + base;
+        int w = 0, h = 0;
+        uint8_t *rgba = NULL;
+        if (size > 8 && !memcmp(bytes, "\x89PNG\r\n\x1a\n", 8)) rgba = png_decode(bytes, size, &w, &h);
+        else if (size > 2 && bytes[0] == 'B' && bytes[1] == 'M') rgba = bmp_decode(bytes, size, &w, &h);
+        LOG("gdiplus.GdipCreateBitmapFromStream: %u bytes, magic %02x%02x%02x%02x", size, bytes[0], bytes[1],
+            size > 2 ? bytes[2] : 0, size > 3 ? bytes[3] : 0);
+        if (rgba) {
+            free(gb->px);
+            gb->px = rgba;
+            gb->w = w;
+            gb->h = h;
+        } else {
+            once("gdiplus.GdipCreateBitmapFromStream: unrecognised image (blank 1x1 bitmap)");
+        }
+    } else {
+        once("gdiplus.GdipCreateBitmapFromStream: not one of our streams (blank 1x1 bitmap)");
+    }
+    if (out) M32(out) = hcom_new(&k_gpbitmap, gb);
+    RET(0, 2);
+}
+SHIM(GdipCreateHBITMAPFromBitmap) {   /* (GpBitmap*, HBITMAP*, ARGB) */
+    if (ARG(1)) M32(ARG(1)) = 0x30007;
+    RET(0, 3);
+}
+SHIM(GdipCloneImage) {                /* (GpImage*, GpImage**) */
+    uint32_t src = ARG(0), out = ARG(2);
+    if (src && M32(src) == k_gpbitmap.vtbl && out) {
+        GpBitmap *s = hcom_host(src), *d = calloc(1, sizeof *d);
+        size_t n = (size_t)s->w * s->h * 4;
+        d->w = s->w;
+        d->h = s->h;
+        d->px = malloc(n ? n : 4);
+        memcpy(d->px, s->px, n);
+        M32(out) = hcom_new(&k_gpbitmap, d);
+    } else if (out) {
+        M32(out) = src;
+    }
+    RET(0, 2);
+}
+SHIM(GdipDisposeImage) {
+    uint32_t g = ARG(0);
+    if (g && M32(g) == k_gpbitmap.vtbl) {
+        GpBitmap *gb = hcom_host(g);
+        if (gb) { free(gb->px); free(gb); }
+        uint32_t left;
+        hcom_release(g, &left);
+    }
+    RET(0, 1);
+}
 
 /* ---- dbghelp: the engine's own crash reporter. No symbols, no walking. ---- */
 SHIM(SymInitialize) { RET(1, 3); }
@@ -499,14 +1119,16 @@ SHIM(SymGetOptions) { RET(0, 0); }
 SHIM(SymSetOptions) { RET(ARG(0), 1); }
 SHIM(SymSetSearchPath) { RET(1, 2); }
 SHIM(SymLoadModule) { RET(0, 6); }
-SHIM(SymUnloadModule) { RET(1, 3); }
+SHIM(SymUnloadModule) { RET(1, 2); }   /* (hProcess, BaseOfDll) */
 SHIM(SymGetModuleInfo) { RET(0, 3); }
 SHIM(SymGetModuleInfo64) { RET(0, 3); }
 SHIM(SymGetSymFromAddr) { RET(0, 4); }
 SHIM(SymGetSymFromAddr64) { RET(0, 4); }
 SHIM(SymGetLineFromAddr) { RET(0, 4); }
 SHIM(SymGetLineFromAddr64) { RET(0, 4); }
-SHIM(SymFindFileInPath) { RET(0, 8); }
+/* (hProcess, SearchPath, FileName, id, two, three, flags, FoundFile,
+ * callback, context) - ten parameters, not eight. */
+SHIM(SymFindFileInPath) { RET(0, 10); }
 SHIM(SymFunctionTableAccess64) { RET(0, 2); }
 SHIM(StackWalk64) { RET(0, 9); }
 SHIM(EnumerateLoadedModules) { RET(0, 3); }
@@ -540,14 +1162,17 @@ SHIM(GetPrivateProfileStringW) { RET(0, 6); }
 SHIM(InterlockedExchangeAdd) { RET(__atomic_fetch_add((uint32_t *)GPTR(ARG(0)), ARG(1), __ATOMIC_SEQ_CST), 2); }
 
 /* Named pipes: the engine creates one for its console/remote log. Refuse
- * cleanly; the callers treat it as "not available". */
-SHIM(CreateNamedPipeA) { once("kernel32.CreateNamedPipeA (no pipes)"); RET(0xFFFFFFFFu, 7); }
+ * cleanly; the callers treat it as "not available". Each of these pops as many
+ * arguments as the API takes: CreateNamedPipeA has eight (not seven),
+ * GetNamedPipeHandleStateA seven (not five), PeekNamedPipe six (not five) and
+ * ReadDirectoryChangesW eight (not six). */
+SHIM(CreateNamedPipeA) { once("kernel32.CreateNamedPipeA (no pipes)"); RET(0xFFFFFFFFu, 8); }
 SHIM(ConnectNamedPipe) { RET(0, 2); }
 SHIM(DisconnectNamedPipe) { RET(0, 1); }
-SHIM(GetNamedPipeHandleStateA) { RET(0, 5); }
+SHIM(GetNamedPipeHandleStateA) { RET(0, 7); }
 SHIM(SetNamedPipeHandleState) { RET(0, 4); }
-SHIM(PeekNamedPipe) { RET(0, 5); }
-SHIM(ReadDirectoryChangesW) { RET(0, 6); }
+SHIM(PeekNamedPipe) { RET(0, 6); }
+SHIM(ReadDirectoryChangesW) { RET(0, 8); }
 SHIM(DeviceIoControl) { RET(0, 8); }
 SHIM(LoadResource) { once("kernel32.LoadResource (resources not exposed)"); RET(0, 2); }
 SHIM(SizeofResource) { RET(0, 2); }
@@ -783,7 +1408,10 @@ SHIM(DuplicateHandle) {
 
 /* ---- private profiles: a small real INI reader/writer ---------------- */
 static int ini_get(const char *host, const char *app, const char *key, char *out, size_t cap) {
-    FILE *f = fopen(host, "r");
+    FILE *f;
+    if (!app) app = "";
+    if (!key) key = "";
+    f = fopen(host, "r");
     if (!f) return 0;
     char line[1024];
     int in_section = 0, found = 0;
@@ -830,7 +1458,11 @@ static void emit(char *out, size_t cap, size_t *on, const char *fmt, ...) {
 static int ini_write(const char *host, const char *app, const char *key, const char *val) {
     char *data = NULL;
     size_t n = 0;
-    FILE *f = fopen(host, "rb");
+    FILE *f;
+    if (!app) app = "";
+    if (!key) key = "";
+    if (!val) val = "";
+    f = fopen(host, "rb");
     if (f) {
         fseek(f, 0, SEEK_END);
         long sz = ftell(f);
@@ -903,8 +1535,13 @@ static int ini_write(const char *host, const char *app, const char *key, const c
     return ok;
 }
 SHIM(GetPrivateProfileStringA) {
+    static int seen;
     uint32_t cap = ARG(4), buf = ARG(3);
     const char *file = GSTR(ARG(5));
+    if (!seen++)
+        LOG("fc2: GetPrivateProfileStringA(app='%s' key='%s' def='%s' file='%s')",
+            GSTR(ARG(0)) ? GSTR(ARG(0)) : "(null)", GSTR(ARG(1)) ? GSTR(ARG(1)) : "(null)",
+            GSTR(ARG(2)) ? GSTR(ARG(2)) : "(null)", file ? file : "(null)");
     char host[1024];
     rt_host_path(file && *file ? file : "port/settings.ini", host, sizeof host);
     char val[512];
@@ -949,8 +1586,30 @@ SHIM(PostMessageA) {
     RET(1, 4);
 }
 SHIM(SetWindowTextA) { RET(1, 2); }
-SHIM(UpdateLayeredWindow) { once("user32.UpdateLayeredWindow (no layered windows)"); RET(0, 8); }
-SHIM(EnumDisplayDevicesA) { RET(0, 4); }
+SHIM(UpdateLayeredWindow) { once("user32.UpdateLayeredWindow (no layered windows)"); RET(0, 9); }
+/* DISPLAY_DEVICEA = cb, DeviceName[32], DeviceString[128], StateFlags,
+ * DeviceID[128], DeviceKey[128]  (0x1a8 bytes). Far Cry 2 walks this looking
+ * for the primary adapter and bails out with ERROR_DISPLAY_PRIMARYDEVICE if
+ * the first call fails, so report exactly one attached primary device. */
+SHIM(EnumDisplayDevicesA) {
+    if (ARG(1) != 0) RET(0, 4);
+    uint32_t dd = ARG(2);
+    if (dd) {
+        static const char name[] = "\\\\.\\DISPLAY1";
+        static const char desc[] = "Generic Display Adapter";
+        uint32_t i;
+        M32(dd) = 0x1A8u;
+        for (i = 0; name[i]; i++) M8(dd + 4 + i) = (uint8_t)name[i];
+        M8(dd + 4 + i) = 0;
+        for (i = 0; desc[i]; i++) M8(dd + 36 + i) = (uint8_t)desc[i];
+        M8(dd + 36 + i) = 0;
+        M32(dd + 164) = 0x1u | 0x4u; /* ATTACHED_TO_DESKTOP | PRIMARY_DEVICE */
+        M8(dd + 168) = 0;
+        M8(dd + 296) = 0;
+    }
+    once("user32.EnumDisplayDevicesA (one synthetic primary adapter)");
+    RET(1, 4);
+}
 SHIM(ToAsciiEx) { RET(0, 6); }
 SHIM(IsCharAlphaNumericW) {
     uint16_t ch = (uint16_t)ARG(0);
@@ -1009,7 +1668,7 @@ static const ShimDef defs[] = {
     M(_CxxThrowException) M(__CxxFrameHandler3) M(_except_handler3)
     M(_except_handler4_common) M(__CppXcptFilter) M(_crt_debugger_hook)
     M(_invalid_parameter_noinfo) M(__clean_type_info_names_internal)
-    M(_initterm_e) M(_beginthreadex)
+    M(_initterm_e) M(_beginthreadex) M(_endthreadex)
 #undef M
     {"msvcr80.dll", "?_type_info_dtor_internal_method@type_info@@QAEXXZ", shim_type_info_dtor_internal},
 
@@ -1062,6 +1721,24 @@ static const ShimDef defs[] = {
     WS(getsockname) WS(inet_addr) WS(inet_ntoa) WS(htonl) WS(htons) WS(ntohl) WS(ntohs)
     WS(WSAAsyncSelect) WS(__WSAFDIsSet)
 #undef WS
+    /* Dunia imports WS2_32 by ordinal (the IAT entries carry the high bit),
+     * so the same offline shims are registered under ws2_32's stable
+     * documented ordinals as well. */
+    {"ws2_32.dll", "#1", shim_accept},        {"ws2_32.dll", "#2", shim_bind},
+    {"ws2_32.dll", "#3", shim_closesocket},   {"ws2_32.dll", "#4", shim_connect},
+    {"ws2_32.dll", "#6", shim_getsockname},   {"ws2_32.dll", "#7", shim_getsockopt},
+    {"ws2_32.dll", "#8", shim_htonl},         {"ws2_32.dll", "#9", shim_htons},
+    {"ws2_32.dll", "#10", shim_ioctlsocket},  {"ws2_32.dll", "#11", shim_inet_addr},
+    {"ws2_32.dll", "#12", shim_inet_ntoa},    {"ws2_32.dll", "#13", shim_listen},
+    {"ws2_32.dll", "#14", shim_ntohl},        {"ws2_32.dll", "#15", shim_ntohs},
+    {"ws2_32.dll", "#16", shim_recv},         {"ws2_32.dll", "#17", shim_recvfrom},
+    {"ws2_32.dll", "#18", shim_select},       {"ws2_32.dll", "#19", shim_send},
+    {"ws2_32.dll", "#20", shim_sendto},       {"ws2_32.dll", "#21", shim_setsockopt},
+    {"ws2_32.dll", "#22", shim_shutdown},     {"ws2_32.dll", "#23", shim_socket},
+    {"ws2_32.dll", "#51", shim_gethostbyaddr}, {"ws2_32.dll", "#52", shim_gethostbyname},
+    {"ws2_32.dll", "#57", shim_gethostname},  {"ws2_32.dll", "#101", shim_WSAAsyncSelect},
+    {"ws2_32.dll", "#111", shim_WSAGetLastError}, {"ws2_32.dll", "#115", shim_WSAStartup},
+    {"ws2_32.dll", "#116", shim_WSACleanup},  {"ws2_32.dll", "#151", shim___WSAFDIsSet},
 
 #define H(n) {"winhttp.dll", #n, shim_##n},
     H(WinHttpOpen) H(WinHttpConnect) H(WinHttpOpenRequest) H(WinHttpSendRequest)
@@ -1155,46 +1832,46 @@ static const ShimDef extra[] = {
     {NULL, NULL, NULL}
 };
 
-/* MSVCP80 iostream/stringstream: registered with NULL implementations so
- * the import resolves and the first call stops with its mangled name
- * (rt_call: "unimplemented import ..."). */
-static const ShimDef msvcp_traps[] = {
-#define ST80(n) {"msvcp80.dll", n, NULL},
-    ST80("??_D?$basic_stringstream@GU?$char_traits@G@std@@V?$allocator@G@2@@std@@QAEXXZ")
-    ST80("?str@?$basic_stringstream@GU?$char_traits@G@std@@V?$allocator@G@2@@std@@QBE?AV?$basic_string@GU?$char_traits@G@std@@V?$allocator@G@2@@2@XZ")
-    ST80("??0?$basic_stringstream@GU?$char_traits@G@std@@V?$allocator@G@2@@std@@QAE@H@Z")
-    ST80("??6?$basic_ostream@GU?$char_traits@G@std@@@std@@QAEAAV01@K@Z")
-    ST80("??6?$basic_ostream@GU?$char_traits@G@std@@@std@@QAEAAV01@J@Z")
-    ST80("?rdbuf@?$basic_ios@DU?$char_traits@D@std@@@std@@QBEPAV?$basic_streambuf@DU?$char_traits@D@std@@@2@XZ")
-    ST80("?rdbuf@?$basic_ios@GU?$char_traits@G@std@@@std@@QBEPAV?$basic_streambuf@GU?$char_traits@G@std@@@2@XZ")
-    ST80("?_Lock@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QAEXXZ")
-    ST80("?_Unlock@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QAEXXZ")
-    ST80("?_Lock@?$basic_streambuf@GU?$char_traits@G@std@@@std@@QAEXXZ")
-    ST80("?_Unlock@?$basic_streambuf@GU?$char_traits@G@std@@@std@@QAEXXZ")
-    ST80("?flush@?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEAAV12@XZ")
-    ST80("?flush@?$basic_ostream@GU?$char_traits@G@std@@@std@@QAEAAV12@XZ")
-    ST80("?tie@?$basic_ios@DU?$char_traits@D@std@@@std@@QBEPAV?$basic_ostream@DU?$char_traits@D@std@@@2@XZ")
-    ST80("?tie@?$basic_ios@GU?$char_traits@G@std@@@std@@QBEPAV?$basic_ostream@GU?$char_traits@G@std@@@2@XZ")
-    ST80("?_Osfx@?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEXXZ")
-    ST80("?_Osfx@?$basic_ostream@GU?$char_traits@G@std@@@std@@QAEXXZ")
-    ST80("?setstate@?$basic_ios@GU?$char_traits@G@std@@@std@@QAEXH_N@Z")
-    ST80("?sputn@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QAEHPBDH@Z")
-    ST80("?sputn@?$basic_streambuf@GU?$char_traits@G@std@@@std@@QAEHPBGH@Z")
-    ST80("?sputc@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QAEHD@Z")
-    ST80("?sputc@?$basic_streambuf@GU?$char_traits@G@std@@@std@@QAEGG@Z")
-    ST80("?fill@?$basic_ios@GU?$char_traits@G@std@@@std@@QBEGXZ")
-    ST80("??_D?$basic_ostringstream@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QAEXXZ")
-    ST80("?str@?$basic_ostringstream@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QBE?AV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@2@XZ")
-    ST80("?str@?$basic_ostringstream@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QAEXABV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@2@@Z")
-    ST80("??0?$basic_ostringstream@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QAE@H@Z")
-    ST80("??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEAAV01@K@Z")
-    ST80("??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEAAV01@G@Z")
-    ST80("??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEAAV01@P6AAAV01@AAV01@@Z@Z")
-    ST80("??$?6DU?$char_traits@D@std@@V?$allocator@D@1@@std@@YAAAV?$basic_ostream@DU?$char_traits@D@std@@@0@AAV10@ABV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@0@@Z")
-    ST80("?endl@std@@YAAAV?$basic_ostream@DU?$char_traits@D@std@@@1@AAV21@@Z")
-    ST80("??_D?$basic_istringstream@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QAEXXZ")
-    ST80("??5?$basic_istream@DU?$char_traits@D@std@@@std@@QAEAAV01@AAK@Z")
-    ST80("??0?$basic_istringstream@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QAE@ABV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@1@H@Z")
+/* MSVCP80 iostream/stringstream, implemented against the host-side stream
+ * registry above.  (These used to be registered with NULL so the first use
+ * stopped with its mangled name; see docs/RECON.md, "Known gaps".) */
+static const ShimDef msvcp_streams[] = {
+#define ST80(n, f) {"msvcp80.dll", n, shim_##f},
+    ST80("??_D?$basic_stringstream@GU?$char_traits@G@std@@V?$allocator@G@2@@std@@QAEXXZ", io_ws_dtor)
+    ST80("?str@?$basic_stringstream@GU?$char_traits@G@std@@V?$allocator@G@2@@std@@QBE?AV?$basic_string@GU?$char_traits@G@std@@V?$allocator@G@2@@2@XZ", io_ws_str_get)
+    ST80("??0?$basic_stringstream@GU?$char_traits@G@std@@V?$allocator@G@2@@std@@QAE@H@Z", io_ws_ctor)
+    ST80("??6?$basic_ostream@GU?$char_traits@G@std@@@std@@QAEAAV01@K@Z", io_ws_putk)
+    ST80("??6?$basic_ostream@GU?$char_traits@G@std@@@std@@QAEAAV01@J@Z", io_ws_putj)
+    ST80("?rdbuf@?$basic_ios@DU?$char_traits@D@std@@@std@@QBEPAV?$basic_streambuf@DU?$char_traits@D@std@@@2@XZ", io_rdbuf)
+    ST80("?rdbuf@?$basic_ios@GU?$char_traits@G@std@@@std@@QBEPAV?$basic_streambuf@GU?$char_traits@G@std@@@2@XZ", io_wrdbuf)
+    ST80("?_Lock@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QAEXXZ", io_lock)
+    ST80("?_Unlock@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QAEXXZ", io_unlock)
+    ST80("?_Lock@?$basic_streambuf@GU?$char_traits@G@std@@@std@@QAEXXZ", io_wlock)
+    ST80("?_Unlock@?$basic_streambuf@GU?$char_traits@G@std@@@std@@QAEXXZ", io_wunlock)
+    ST80("?flush@?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEAAV12@XZ", io_flush)
+    ST80("?flush@?$basic_ostream@GU?$char_traits@G@std@@@std@@QAEAAV12@XZ", io_wflush)
+    ST80("?tie@?$basic_ios@DU?$char_traits@D@std@@@std@@QBEPAV?$basic_ostream@DU?$char_traits@D@std@@@2@XZ", io_tie)
+    ST80("?tie@?$basic_ios@GU?$char_traits@G@std@@@std@@QBEPAV?$basic_ostream@GU?$char_traits@G@std@@@2@XZ", io_wtie)
+    ST80("?_Osfx@?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEXXZ", io_osfx)
+    ST80("?_Osfx@?$basic_ostream@GU?$char_traits@G@std@@@std@@QAEXXZ", io_wosfx)
+    ST80("?setstate@?$basic_ios@GU?$char_traits@G@std@@@std@@QAEXH_N@Z", io_wsetstate)
+    ST80("?sputn@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QAEHPBDH@Z", io_putn)
+    ST80("?sputn@?$basic_streambuf@GU?$char_traits@G@std@@@std@@QAEHPBGH@Z", io_wputn)
+    ST80("?sputc@?$basic_streambuf@DU?$char_traits@D@std@@@std@@QAEHD@Z", io_putc)
+    ST80("?sputc@?$basic_streambuf@GU?$char_traits@G@std@@@std@@QAEGG@Z", io_wputc)
+    ST80("?fill@?$basic_ios@GU?$char_traits@G@std@@@std@@QBEGXZ", io_fill)
+    ST80("??_D?$basic_ostringstream@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QAEXXZ", io_os_dtor)
+    ST80("?str@?$basic_ostringstream@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QBE?AV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@2@XZ", io_os_str_get)
+    ST80("?str@?$basic_ostringstream@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QAEXABV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@2@@Z", io_os_str_set)
+    ST80("??0?$basic_ostringstream@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QAE@H@Z", io_os_ctor)
+    ST80("??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEAAV01@K@Z", io_os_putk)
+    ST80("??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEAAV01@G@Z", io_os_putg)
+    ST80("??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEAAV01@P6AAAV01@AAV01@@Z@Z", io_os_putmanip)
+    ST80("??$?6DU?$char_traits@D@std@@V?$allocator@D@1@@std@@YAAAV?$basic_ostream@DU?$char_traits@D@std@@@0@AAV10@ABV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@0@@Z", io_put_str)
+    ST80("?endl@std@@YAAAV?$basic_ostream@DU?$char_traits@D@std@@@1@AAV21@@Z", io_endl)
+    ST80("??_D?$basic_istringstream@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QAEXXZ", io_is_dtor)
+    ST80("??5?$basic_istream@DU?$char_traits@D@std@@@std@@QAEAAV01@AAK@Z", io_is_getk)
+    ST80("??0?$basic_istringstream@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QAE@ABV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@1@H@Z", io_is_ctor)
 #undef ST80
     {NULL, NULL, NULL}
 };
@@ -1204,7 +1881,21 @@ void fc2_shims_init(void) {
     rt_register_shims(extra);
     msvcrt_register_as_msvcr80();
 
-    rt_register_shims(msvcp_traps);
+    rt_register_shims(msvcp_streams);
+
+    /* Guest COM objects: the ole32 memory stream and the GDI+ bitmap the
+     * engine holds a pointer to. Both need a real vtable so the engine's
+     * Release()/dispose calls land somewhere valid. */
+    static const ShimFn istream_fns[] = {
+        shim_istream_QueryInterface, shim_istream_AddRef,        shim_istream_Release,
+        shim_istream_Read,           shim_istream_Write,         shim_istream_Seek,
+        shim_istream_SetSize,        shim_istream_CopyTo,        shim_istream_Commit,
+        shim_istream_Revert,         shim_istream_LockRegion,    shim_istream_UnlockRegion,
+        shim_istream_Stat,           shim_istream_Clone,
+    };
+    static const ShimFn gpbitmap_fns[] = {shim_gpbitmap_vcall};
+    hcom_class_init(&k_istream, "IStream", istream_fns, (int)(sizeof istream_fns / sizeof istream_fns[0]));
+    hcom_class_init(&k_gpbitmap, "GpBitmap", gpbitmap_fns, (int)(sizeof gpbitmap_fns / sizeof gpbitmap_fns[0]));
 
     LOG("fc2_shims: %d entries (MSVCR80/MSVCP80, offline Win32, SEH traps)",
         (int)(sizeof defs / sizeof defs[0] - 1));

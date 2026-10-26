@@ -18,6 +18,7 @@ game/
 # the working copy of the game and the reference ports, kept outside git
 /fc2/
 /fc2.rar
+/spider/
 # ...except the build glue for the recompiled code (not a game file):
 !android/app/jni/game/
 !android/app/jni/game/CMakeLists.txt
@@ -53,4 +54,5 @@ __pycache__/
 *.pyc
 port/
 log.txt
+*.log
 .DS_Store

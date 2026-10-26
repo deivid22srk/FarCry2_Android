@@ -41,15 +41,16 @@ SHIM(CoCreateInstance) {
     extern int xaudio2_create(uint32_t clsid, uint32_t *out);
     uint32_t obj;
     if (ARG(4) && xaudio2_create(ARG(0), &obj)) { M32(ARG(4)) = obj; RET(0, 5); }
-#ifdef GAME_USM
-    { extern int usm_cocreate(uint32_t clsid, uint32_t iid, uint32_t out);
-      if (usm_cocreate(ARG(0), ARG(3), ARG(4))) RET(0, 5); }
-#endif
+    { extern int dxdiag_cocreate(uint32_t clsid, uint32_t iid, uint32_t out);
+      if (dxdiag_cocreate(ARG(0), ARG(3), ARG(4))) RET(0, 5); }
     LOG("CoCreateInstance -> E_NOINTERFACE");
     if (ARG(4)) M32(ARG(4)) = 0;
     RET(0x80004002u, 5);
 }
 SHIM(CoSetProxyBlanket) { RET(0, 8); }
+/* WMI's first step (systemdetection.dll): accept the default security and let
+ * the CoCreateInstance(CLSID_WbemLocator) that follows fail cleanly. */
+SHIM(CoInitializeSecurity) { RET(0, 9); }
 SHIM(SysAllocString) {
     uint32_t s = ARG(0);
     if (!s) RET(0, 1);
@@ -61,6 +62,48 @@ SHIM(SysAllocString) {
     RET(p + 4, 1);
 }
 SHIM(SysFreeString) { if (ARG(0)) gfree(ARG(0) - 4); RET(0, 1); }
+
+/* ---- advapi32: CryptoAPI ------------------------------------------------
+ * systemdetection.dll keeps its CPU/GPU "score" tables encrypted and would
+ * decrypt them here. This port does not implement CAPI, so the context
+ * acquisition fails and the library falls back to its built-in defaults. */
+SHIM(CryptAcquireContextW) { RET(0, 5); }  /* FALSE: no provider */
+SHIM(CryptReleaseContext) { RET(1, 2); }
+SHIM(CryptGenKey) { RET(0, 4); }
+SHIM(CryptDestroyKey) { RET(1, 1); }
+SHIM(CryptEncrypt) { RET(0, 7); }
+SHIM(CryptDecrypt) { RET(0, 6); }
+
+/* ---- opengl32: the GL half of the GPU probe ----------------------------
+ * There is no OpenGL in this port (the game is D3D9 through DXVK), but
+ * systemdetection.dll calls glGetString(GL_EXTENSIONS) to grade the adapter
+ * and passes the result straight into a Gear string helper that asserts it is
+ * non-NULL. So the probe has to answer: report the capabilities the D3D9 path
+ * really has (shader model 3.0) under a representative adapter name. */
+SHIM(glGetString) {
+    static uint32_t vendor, renderer, version, ext;
+    switch (ARG(0)) {
+    case 0x1F00: /* GL_VENDOR */
+        if (!vendor) vendor = gstrdup("NVIDIA Corporation");
+        RET(vendor, 1);
+    case 0x1F01: /* GL_RENDERER */
+        if (!renderer) renderer = gstrdup("GeForce GTX 1080/PCIe/SSE2");
+        RET(renderer, 1);
+    case 0x1F02: /* GL_VERSION */
+        if (!version) version = gstrdup("3.3.0");
+        RET(version, 1);
+    case 0x1F03: /* GL_EXTENSIONS: shader model 3.0 feature set */
+        if (!ext) ext = gstrdup("GL_ARB_fragment_shader GL_ARB_fragment_program "
+                                "GL_ARB_vertex_shader GL_NV_vertex_program "
+                                "GL_ARB_vertex_program GL_ARB_shading_language_100");
+        RET(ext, 1);
+    default:
+        RET(0, 1);
+    }
+}
+SHIM(wglCreateContext) { RET(0, 1); }
+SHIM(wglDeleteContext) { RET(1, 1); }
+SHIM(wglMakeCurrent) { RET(0, 2); }
 
 /* ---- winmm ---- */
 static uint64_t now_ms(void) {
@@ -144,6 +187,16 @@ static const ShimDef defs[] = {
     {"ADVAPI32.dll", "RegQueryValueExA", shim_RegQueryValueExA},
     {"ADVAPI32.dll", "RegSetValueExA", shim_RegSetValueExA},
     {"ADVAPI32.dll", "RegCloseKey", shim_RegCloseKey},
+    {"ADVAPI32.dll", "CryptAcquireContextW", shim_CryptAcquireContextW},
+    {"ADVAPI32.dll", "CryptReleaseContext", shim_CryptReleaseContext},
+    {"ADVAPI32.dll", "CryptGenKey", shim_CryptGenKey},
+    {"ADVAPI32.dll", "CryptDestroyKey", shim_CryptDestroyKey},
+    {"ADVAPI32.dll", "CryptEncrypt", shim_CryptEncrypt},
+    {"ADVAPI32.dll", "CryptDecrypt", shim_CryptDecrypt},
+    {"OPENGL32.dll", "glGetString", shim_glGetString},
+    {"OPENGL32.dll", "wglCreateContext", shim_wglCreateContext},
+    {"OPENGL32.dll", "wglDeleteContext", shim_wglDeleteContext},
+    {"OPENGL32.dll", "wglMakeCurrent", shim_wglMakeCurrent},
     {"SHELL32.dll", "SHGetFolderPathA", shim_SHGetFolderPathA},
     {"SHELL32.dll", "SHCreateDirectoryExA", shim_SHCreateDirectoryExA},
     {"SHELL32.dll", "ShellExecuteA", shim_ShellExecuteA},
@@ -152,6 +205,7 @@ static const ShimDef defs[] = {
     {"ole32.dll", "CoUninitialize", shim_CoUninitialize},
     {"ole32.dll", "CoCreateInstance", shim_CoCreateInstance},
     {"ole32.dll", "CoSetProxyBlanket", shim_CoSetProxyBlanket},
+    {"ole32.dll", "CoInitializeSecurity", shim_CoInitializeSecurity},
     {"OLEAUT32.dll", "SysAllocString", shim_SysAllocString},
     {"OLEAUT32.dll", "SysFreeString", shim_SysFreeString},
     {"OLEAUT32.dll", "#2", shim_SysAllocString},

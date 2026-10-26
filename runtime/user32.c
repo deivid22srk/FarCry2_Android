@@ -150,6 +150,21 @@ SHIM(CreateWindowExA) {
     post_activate();
     RET(FAKE_HWND, 12);
 }
+/* systemdetection.dll creates a hidden window to get a DC for its OpenGL/GPU
+ * probe. WNDCLASSW (non-Ex) has lpfnWndProc at +4. A distinct handle keeps it
+ * separate from the game's window, and it is never activated: it has no
+ * message loop, so the proc is not recorded. */
+SHIM(RegisterClassW) {
+    LOG("RegisterClassW wndproc=%08x", M32(ARG(0) + 4));
+    RET(0xC002, 1);
+}
+SHIM(CreateWindowExW) {
+    LOG("CreateWindowExW (hidden detection window)");
+    RET(0x00020010u, 12);
+}
+SHIM(UnregisterClassW) { RET(1, 2); }
+SHIM(DefWindowProcW) { RET(0, 4); }
+SHIM(LoadStringA) { RET(0, 4); }
 SHIM(DestroyWindow) { RET(1, 1); }
 SHIM(ShowWindow) { post_activate(); RET(1, 2); }
 SHIM(UpdateWindow) { RET(1, 1); }
@@ -317,7 +332,8 @@ SHIM(MessageBoxW) {
     int i = 0;
     for (; s && i < 511 && M16(s + 2 * i); i++) buf[i] = (char)M16(s + 2 * i);
     buf[i] = 0;
-    LOG("MessageBoxW: %s", buf);
+    LOG("MessageBoxW: ret=%08x hwnd=%08x text=%08x cap=%08x [%s]",
+        M32(c->r[4]), ARG(0), ARG(1), ARG(2), buf);
     RET(1, 4);
 }
 
@@ -325,6 +341,10 @@ SHIM(CreateDCA) { RET(0x30001, 4); }
 SHIM(DeleteDC) { RET(1, 1); }
 SHIM(DeleteObject) { RET(1, 1); }
 SHIM(ExtEscape) { RET(0, 6); }
+/* Pixel-format selection for the hidden GL-probe window; the GL context itself
+ * is never created (see opengl32 in runtime/misc.c). */
+SHIM(ChoosePixelFormat) { RET(1, 2); }
+SHIM(SetPixelFormat) { RET(1, 3); }
 
 /* GDI text/font calls used by D3DX's font code; fonts are not rendered. */
 SHIM(CreateDIBSection) { RET(0x0u, 6); }
@@ -416,16 +436,36 @@ SHIM(ToUnicodeEx) {
 SHIM(TrackMouseEvent) { RET(1, 1); }
 SHIM(SetWindowPos) { RET(1, 7); }
 SHIM(SetWindowLongA) { RET(0, 3); }
-/* One display mode, the host screen size (DEVMODEA fields by offset). */
+/* Far Cry 2 enumerates modes with EnumDisplaySettingsA(name, i, &dm) from
+ * i = 0 upwards until the call fails, then picks the one closest to the
+ * current resolution. Expose a real list (plus the host screen mode last)
+ * instead of a single mode, and answer -1/-2 with the desktop mode. */
+static const struct { uint16_t w, h; } g_disp_modes[] = {
+    {640, 480},   {720, 480},   {720, 576},   {800, 600},  {848, 480},
+    {1024, 768},  {1152, 864},  {1280, 720},  {1280, 768}, {1280, 800},
+    {1280, 960},  {1280, 1024}, {1360, 768},  {1366, 768}, {1440, 900},
+    {1600, 900},  {1600, 1200}, {1680, 1050}, {1920, 1080}, {1920, 1200},
+    {2048, 1536}, {2560, 1440},
+};
 SHIM(EnumDisplaySettingsA) {
     int32_t i = (int32_t)ARG(1);
     uint32_t d = ARG(2);
-    if (i != -1 && i != -2 && i != 0) RET(0, 3);
+    uint32_t w, h, nm = (uint32_t)(sizeof g_disp_modes / sizeof g_disp_modes[0]);
+    if (i >= 0) {
+        if ((uint32_t)i < nm) { w = g_disp_modes[i].w; h = g_disp_modes[i].h; }
+        else if ((uint32_t)i == nm) { w = (uint32_t)g_screen_w; h = (uint32_t)g_screen_h; }
+        else RET(0, 3);
+    } else if (i == -1 || i == -2) {
+        w = (uint32_t)g_screen_w;
+        h = (uint32_t)g_screen_h;
+    } else {
+        RET(0, 3);
+    }
     M16(d + 36) = 156;
     M32(d + 40) = 0x001C0000u;  /* DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT */
     M32(d + 104) = 32;
-    M32(d + 108) = (uint32_t)g_screen_w;
-    M32(d + 112) = (uint32_t)g_screen_h;
+    M32(d + 108) = w;
+    M32(d + 112) = h;
     M32(d + 120) = 60;
     RET(1, 3);
 }
@@ -451,11 +491,12 @@ static const ShimDef defs[] = {
     S(GetTopWindow) S(GetActiveWindow) S(GetWindow) S(UnregisterClassA) S(EndPaint) S(ReleaseDC) S(IsWindowVisible) S(ChangeDisplaySettingsA) S(RegisterClassA) S(GetDC) S(GetClassLongA) S(BeginPaint) S(GetWindowThreadProcessId) S(ClientToScreen) S(ScreenToClient) S(GetCursorPos) S(GetWindowRect) S(GetClientRect)
     S(GetKeyboardLayout) S(ToUnicodeEx) S(TrackMouseEvent) S(SetWindowPos) S(SetWindowLongA)
     S(EnumDisplaySettingsA) S(EnumDisplayMonitors)
+    S(RegisterClassW) S(CreateWindowExW) S(UnregisterClassW) S(DefWindowProcW) S(LoadStringA)
 #undef S
 #define S(n) {"GDI32.dll", #n, shim_##n},
     S(CreateDCA) S(DeleteDC) S(DeleteObject) S(ExtEscape)
     S(SetStretchBltMode) S(StretchBlt) S(GetDIBits) S(GetPixel) S(SetPixel) S(CreateCompatibleBitmap) S(GetDeviceCaps)
-    S(CreateDIBSection) S(GetGlyphOutlineA) S(GetTextMetricsA) S(GetObjectW) S(SelectObject) S(GetCharacterPlacementA) S(GetCharacterPlacementW) S(SetTextColor) S(SetBkColor) S(SetBkMode) S(GetTextMetricsW) S(GetFontLanguageInfo) S(CreateFontIndirectA) S(CreateFontIndirectW) S(SetTextAlign) S(SetMapMode) S(CreateCompatibleDC) S(ExtTextOutA) S(MoveToEx) S(ExtTextOutW) S(TranslateCharsetInfo) S(GetCurrentObject) S(GetOutlineTextMetricsA) S(GetGlyphOutlineW) S(GetObjectA)
+    S(CreateDIBSection) S(GetGlyphOutlineA) S(GetTextMetricsA) S(GetObjectW) S(SelectObject) S(GetCharacterPlacementA) S(GetCharacterPlacementW) S(SetTextColor) S(SetBkColor) S(SetBkMode) S(GetTextMetricsW) S(GetFontLanguageInfo) S(CreateFontIndirectA) S(CreateFontIndirectW) S(SetTextAlign) S(SetMapMode) S(CreateCompatibleDC) S(ExtTextOutA) S(MoveToEx) S(ExtTextOutW) S(TranslateCharsetInfo) S(GetCurrentObject) S(GetOutlineTextMetricsA) S(GetGlyphOutlineW) S(GetObjectA) S(ChoosePixelFormat) S(SetPixelFormat)
 #undef S
     {NULL, NULL, NULL}
 };

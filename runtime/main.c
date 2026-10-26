@@ -153,7 +153,10 @@ static uint32_t load_pe(const char *path, uint32_t want_base, const char *modnam
         uint32_t iat = base + M32(d + 16);
         for (; M32(ilt); ilt += 4, iat += 4) {
             uint32_t e = M32(ilt);
-            char name[128];
+            /* MSVC mangles are long; the longest import in Dunia.dll is 140
+             * bytes, so a 128-byte buffer used to cut the name short and
+             * silently bind the import to the abort stub instead of its shim. */
+            char name[1024];
             if (e & 0x80000000u) snprintf(name, sizeof name, "#%u", e & 0xFFFF);
             else snprintf(name, sizeof name, "%s", (const char *)(MEM + base + e + 2));
             M32(iat) = rt_import(dll, name);

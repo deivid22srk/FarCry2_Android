@@ -3,6 +3,7 @@
 #include "rt.h"
 #include "rt_table.h"
 #include <string.h>
+#include <stdio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -213,8 +214,21 @@ uint32_t rt_invoke(CPU *c, uint32_t fn, int nargs, const uint32_t *args) {
 void rt_unimpl(CPU *c, uint32_t addr, const char *what) {
     rt_fatal("unimplemented instruction '%s' at %08x", what, addr);
 }
-
 void rt_int3(CPU *c, uint32_t addr) {
+    /* Guest int3/assert: dump the stack words that look like code addresses so
+     * the assert can be traced back to its caller without a debugger. */
+    uint32_t esp = c->r[4];
+    fprintf(stderr, "int3 at %08x  esp=%08x\n", addr, esp);
+    for (int i = 0; i < 384; i++) {
+        uint32_t v = M32(esp + 4 * i);
+        const char *mod = NULL;
+        uint32_t off = 0;
+        if (v >= 0x00400000u && v < 0x00410000u) { mod = "fc2"; off = v - 0x00400000u; }
+        else if (v >= 0x09000000u && v < 0x09040000u) { mod = "bink"; off = v - 0x09000000u; }
+        else if (v >= 0x10000000u && v < 0x11A00000u) { mod = "dunia"; off = v - 0x10000000u; }
+        else if (v >= 0x12000000u && v < 0x12050000u) { mod = "sdet"; off = v - 0x12000000u; }
+        if (mod) fprintf(stderr, "  [%3d] %08x  %s+%x\n", i, v, mod, off);
+    }
     rt_fatal("int3 at %08x", addr);
 }
 

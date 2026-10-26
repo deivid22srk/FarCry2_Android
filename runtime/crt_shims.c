@@ -783,6 +783,7 @@ SHIM(gethostbyname) {
 static const uint8_t k_clsid_dxdiag[16] = {0x71, 0x80, 0x5b, 0xa6, 0xfe, 0x3b, 0x13, 0x42,
                                            0x9a, 0x5b, 0x49, 0x1d, 0xa4, 0x46, 0x1c, 0xa7};
 static uint32_t g_diag_provider, g_diag_root, g_diag_sysinfo;
+static uint32_t g_diag_display, g_diag_device;
 
 static void wide_to_ascii(uint32_t w, char *out, size_t n) {
     size_t i = 0;
@@ -830,6 +831,16 @@ SHIM(diag_getchild) {
         if (ARG(2)) M32(ARG(2)) = g_diag_sysinfo;
         RET(0, 3);
     }
+    if (!strcmp(name, "DxDiag_DisplayDevices")) {
+        if (ARG(2)) M32(ARG(2)) = g_diag_display;
+        RET(0, 3);
+    }
+    /* The display-device container holds one child per adapter, named by index;
+     * systemdetection.dll only ever looks up the first ("0"). */
+    if (!strcmp(name, "0")) {
+        if (ARG(2)) M32(ARG(2)) = g_diag_device;
+        RET(0, 3);
+    }
     LOG("DxDiag: GetChildContainer(\"%s\") -> E_FAIL", name);
     RET(0x80004005u, 3);
 }
@@ -847,6 +858,11 @@ SHIM(diag_getprop) {
     if (!strcmp(name, "dwDirectXVersionMajor")) { M16(var) = 19; M32(var + 8) = 9; RET(0, 3); }
     if (!strcmp(name, "dwDirectXVersionMinor")) { M16(var) = 19; M32(var + 8) = 0; RET(0, 3); }
     if (!strcmp(name, "szDirectXVersionLetter")) { M16(var) = 8; M32(var + 8) = bstr_alloc("c"); RET(0, 3); }
+    /* DxDiag_DisplayDevices device properties (the mode the adapter is on). */
+    if (!strcmp(name, "dwWidth"))       { M16(var) = 19; M32(var + 8) = 1024; RET(0, 3); }
+    if (!strcmp(name, "dwHeight"))      { M16(var) = 19; M32(var + 8) = 768;  RET(0, 3); }
+    if (!strcmp(name, "dwBpp"))         { M16(var) = 19; M32(var + 8) = 32;   RET(0, 3); }
+    if (!strcmp(name, "dwRefreshRate")) { M16(var) = 19; M32(var + 8) = 60;   RET(0, 3); }
     LOG("DxDiag: GetProp(\"%s\") -> E_FAIL", name);
     RET(0x80004005u, 3);
 }
@@ -858,8 +874,11 @@ static uint32_t mk_com_object(uint32_t vtbl) {
     return o;
 }
 
-/* Called from ole32!CoCreateInstance (runtime/misc.c). 1 = handled. */
-int usm_cocreate(uint32_t clsid, uint32_t iid, uint32_t out) {
+/* Called from ole32!CoCreateInstance (runtime/misc.c). 1 = handled.
+ * Despite the DxDiag provider being non-Microsoft, it is the standard way a
+ * game asks Windows for its DirectX version; both Spider-Man and Far Cry 2
+ * (through systemdetection.dll) use it, so it is game-independent. */
+int dxdiag_cocreate(uint32_t clsid, uint32_t iid, uint32_t out) {
     (void)iid;
     if (!clsid || !out || memcmp(MEM + clsid, k_clsid_dxdiag, 16)) return 0;
     M32(out) = g_diag_provider;
@@ -886,6 +905,8 @@ static void dxdiag_init(void) {
     g_diag_provider = mk_com_object(pv);
     g_diag_root = mk_com_object(cv);
     g_diag_sysinfo = mk_com_object(cv);
+    g_diag_display = mk_com_object(cv);
+    g_diag_device = mk_com_object(cv);
 }
 
 /* binkw32 makes its decoder pages writable at start-up; guest memory is always
@@ -976,6 +997,9 @@ static const ShimDef defs[] = {
 #define O(n) {"oleaut32.dll", #n, shim_##n},
     O(SysStringLen) O(VariantInit) O(VariantClear)
 #undef O
+    /* by ordinal, which is how the Far Cry 2 engine imports them */
+    {"oleaut32.dll", "#8", shim_VariantInit},
+    {"oleaut32.dll", "#9", shim_VariantClear},
 
     {"psapi.dll", "GetProcessMemoryInfo", shim_GetProcessMemoryInfo},
     {"advapi32.dll", "RegCreateKeyA", shim_RegCreateKeyA},

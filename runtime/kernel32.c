@@ -320,12 +320,16 @@ static void *thread_main(void *arg) {
     return NULL;
 }
 
-SHIM(CreateThread) {
+/* Shared by CreateThread and msvcr80!_beginthreadex: both must hand back a
+ * real waitable handle, and both must honour CREATE_SUSPENDED (4) - Far Cry 2
+ * creates worker threads suspended, finishes wiring up their parameter block
+ * and only then resumes them. */
+uint32_t rt_thread_create(uint32_t start, uint32_t param, uint32_t flags, uint32_t *tid_out) {
     GThread *t = calloc(1, sizeof *t);
     t->w.kind = H_THREAD;
-    t->start = ARG(2);
-    t->param = ARG(3);
-    t->suspended = (ARG(4) & 4) != 0;
+    t->start = start;
+    t->param = param;
+    t->suspended = (flags & 4) != 0;
     t->exit_code = 0x103; /* STILL_ACTIVE */
     /* the id returned here must be what the thread's GetCurrentThreadId says:
      * Skyrim stores its IO thread's id from here and compares the two */
@@ -337,8 +341,16 @@ SHIM(CreateThread) {
     pthread_attr_init(&at);
     pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
     pthread_create(&t->pt, &at, thread_main, t);
-    if (ARG(5)) M32(ARG(5)) = t->tid;
-    LOG("CreateThread start=%08x param=%08x", t->start, t->param);
+    if (tid_out) *tid_out = t->tid;
+    LOG("thread create start=%08x param=%08x flags=%x%s", start, param, flags,
+        t->suspended ? " (suspended)" : "");
+    return h;
+}
+
+SHIM(CreateThread) {
+    uint32_t tid = 0;
+    uint32_t h = rt_thread_create(ARG(2), ARG(3), ARG(4), &tid);
+    if (ARG(5)) M32(ARG(5)) = tid;
     RET(h, 6);
 }
 
@@ -489,6 +501,13 @@ SHIM(LeaveCriticalSection) {
 
 /* ===================== events / mutexes / semaphores ===================== */
 SHIM(CreateEventA) {
+    Waitable *w = w_new(H_EVENT);
+    w->manual = ARG(1) != 0;
+    w->signaled = ARG(2) != 0;
+    RET(h_new(H_EVENT, w), 4);
+}
+/* The object name is ignored (this port has a single guest process). */
+SHIM(CreateEventW) {
     Waitable *w = w_new(H_EVENT);
     w->manual = ARG(1) != 0;
     w->signaled = ARG(2) != 0;
@@ -1275,6 +1294,29 @@ SHIM(GetEnvironmentVariableA) {
     rt_set_last_error(c, ERROR_ENVVAR_NOT_FOUND);
     RET(0, 3);
 }
+/* Same lookup, UTF-16 name and value (systemdetection.dll reads its PCI/GPU
+ * database path from the environment). */
+SHIM(GetEnvironmentVariableW) {
+    char name[128];
+    int i = 0;
+    if (ARG(0)) for (; i < 127 && M16(ARG(0) + 2 * i); i++) name[i] = (char)M16(ARG(0) + 2 * i);
+    name[i] = 0;
+    uint32_t buf = ARG(1), cap = ARG(2);
+    if (!name[0]) RET(0, 3);
+    size_t nl = strlen(name);
+    for (const char *p = (const char *)MEM + g_env; *p; p += strlen(p) + 1) {
+        if (strncasecmp(p, name, nl) || p[nl] != '=') continue;
+        const char *v = p + nl + 1;
+        size_t vl = strlen(v);
+        if (cap > vl) {
+            for (size_t k = 0; k < vl; k++) M16(buf + 2 * k) = (uint8_t)v[k];
+            M16(buf + 2 * vl) = 0;
+        }
+        RET((uint32_t)vl + 1, 3);
+    }
+    rt_set_last_error(c, ERROR_ENVVAR_NOT_FOUND);
+    RET(0, 3);
+}
 SHIM(ExpandEnvironmentStringsA) {
     const char *s = GSTR(ARG(0));
     uint32_t n = (uint32_t)strlen(s) + 1;
@@ -1304,6 +1346,20 @@ SHIM(GetVersionExA) {
     if (sz >= 156) { M16(v + 148) = 3; M16(v + 154) = 1; }
     RET(1, 1);
 }
+/* OSVERSIONINFOW/OSVERSIONINFOEXW: same XP SP3 answer, wide CSD string. */
+SHIM(GetVersionExW) {
+    uint32_t v = ARG(0);
+    uint32_t sz = M32(v);
+    memset(MEM + v + 4, 0, sz - 4);
+    M32(v + 4) = 5;
+    M32(v + 8) = 1;
+    M32(v + 12) = 2600;
+    M32(v + 16) = 2;
+    const char *sp = "Service Pack 3";
+    for (int i = 0; i <= (int)strlen(sp); i++) M16(v + 20 + 2 * i) = (uint8_t)sp[i];
+    if (sz >= 284) { M16(v + 276) = 3; M16(v + 282) = 1; }
+    RET(1, 1);
+}
 SHIM(VerifyVersionInfoA) { RET(1, 4); }
 SHIM(VerSetConditionMask) {
     /* ULONGLONG ConditionMask passed as 2 dwords, then 2 more args; returns in edx:eax */
@@ -1311,6 +1367,11 @@ SHIM(VerSetConditionMask) {
     RET(ARG(0), 4);
 }
 SHIM(IsDebuggerPresent) { RET(0, 0); }
+/* This port is a 32-bit Windows as far as the guest is concerned. */
+SHIM(IsWow64Process) {
+    if (ARG(1)) M32(ARG(1)) = 0;
+    RET(1, 2);
+}
 SHIM(GetLastError) { RET(rt_get_last_error(c), 0); }
 SHIM(SetLastError) { rt_set_last_error(c, ARG(0)); RET(0, 1); }
 SHIM(SetUnhandledExceptionFilter) { RET(0, 1); }
@@ -1371,13 +1432,26 @@ static uint32_t module_base_of(uint32_t a) {
     return 0;
 }
 /* GetModuleHandleExA(flags, name, out): name wins, else the address. */
+/* GetModuleHandleExA(flags, name, out). The flags matter: with
+ * GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS the second argument is a *code
+ * address*, not a string. Dunia asks for its own module that way
+ * (`push &hModule; push 0x10006150; push 4; call GetModuleHandleExA`) and then
+ * reads its splash image with FindResourceA(NULL-relative type "PNG", ids
+ * 100/101) out of that module. Reading the code bytes as a name produced a
+ * pseudo handle, so the lookup ran against the exe, found nothing, and GDI+
+ * was handed a zero-byte stream (the engine then drew nothing and the run
+ * crashed further in). */
 SHIM(GetModuleHandleExA) {
-    const char *n = GSTR(ARG(1));
-    uint32_t h = 0;
-    if (n && *n) {
-        if (!module_absent(n)) h = module_base(n) ? module_base(n) : pseudo_module(n);
+    uint32_t flags = ARG(0), h = 0;
+    if (flags & 4u /* GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS */) {
+        h = module_base_of(ARG(1));
     } else {
-        h = module_base_of(ARG(0));
+        const char *n = GSTR(ARG(1));
+        if (n && *n) {
+            if (!module_absent(n)) h = module_base(n) ? module_base(n) : pseudo_module(n);
+        } else {
+            h = GUEST_IMAGE_BASE;
+        }
     }
     if (ARG(2)) M32(ARG(2)) = h;
     RET(h ? 1 : 0, 3);
@@ -1423,7 +1497,7 @@ SHIM(FreeLibrary) { RET(1, 1); }
 SHIM(GetProcAddress) {
     GModule *m = h_get(ARG(0), H_MODULE);
     uint32_t pn = ARG(1);
-    char name[64];
+    char name[1024];   /* mangled C++ names are long; see rt_import() */
     if (pn < 0x10000) snprintf(name, sizeof name, "#%u", pn);
     else snprintf(name, sizeof name, "%s", GSTR(pn));
     const char *dll = m ? m->name : module_name_of(ARG(0)) ? module_name_of(ARG(0)) : GAME_EXE;
@@ -2050,13 +2124,13 @@ static const ShimDef k32[] = {
     S(SetProcessAffinityMask) S(GetProcessAffinityMask) S(SetThreadExecutionState) S(Sleep)
     S(TlsAlloc) S(TlsFree) S(TlsGetValue) S(TlsSetValue)
     S(InitializeCriticalSection) S(DeleteCriticalSection) S(EnterCriticalSection) S(LeaveCriticalSection)
-    S(CreateEventA) S(SetEvent) S(ResetEvent) S(CreateMutexA) S(ReleaseMutex) S(CreateSemaphoreA)
+    S(CreateEventA) S(CreateEventW) S(SetEvent) S(ResetEvent) S(CreateMutexA) S(ReleaseMutex) S(CreateSemaphoreA)
     S(ReleaseSemaphore) S(WaitForSingleObject) S(WaitForMultipleObjects) S(WaitForMultipleObjectsEx)
     S(CreateFileA) S(ReadFile) S(WriteFile) S(SetFilePointer) S(SetFilePointerEx) S(GetFileSize)
     S(GetFileType) S(FlushFileBuffers) S(SetEndOfFile) S(CloseHandle) S(GetFileAttributesA)
     S(GetFileAttributesExA) S(DeleteFileA) S(MoveFileA) S(CreateDirectoryA) S(FindFirstFileA)
     S(FindNextFileA) S(FindClose)
-    S(FindFirstFileW) S(FindNextFileW) S(GetFileTime) S(GetEnvironmentVariableA) S(GetModuleHandleExA)
+    S(FindFirstFileW) S(FindNextFileW) S(GetFileTime) S(GetEnvironmentVariableA) S(GetEnvironmentVariableW) S(GetModuleHandleExA)
     S(GetProcessHeap) S(HeapCreate) S(HeapDestroy) S(HeapAlloc) S(HeapFree) S(HeapSize) S(HeapReAlloc)
     S(VirtualAlloc) S(VirtualFree)
     S(InterlockedIncrement) S(InterlockedDecrement) S(InterlockedExchange)
@@ -2065,6 +2139,7 @@ static const ShimDef k32[] = {
     S(GetCommandLineA) S(GetEnvironmentStrings) S(GetEnvironmentStringsW) S(FreeEnvironmentStringsA)
     S(FreeEnvironmentStringsW) S(SetEnvironmentVariableA) S(ExpandEnvironmentStringsA) S(GetStartupInfoA)
     S(GetStdHandle) S(SetStdHandle) S(SetHandleCount) S(GetVersionExA) S(VerifyVersionInfoA)
+    S(GetVersionExW) S(IsWow64Process)
     S(VerSetConditionMask) S(IsDebuggerPresent) S(GetLastError) S(SetLastError)
     S(SetUnhandledExceptionFilter) S(UnhandledExceptionFilter) S(SetConsoleCtrlHandler)
     S(OutputDebugStringA) S(OutputDebugStringW) S(DebugBreak) S(FatalAppExitA) S(ExitProcess)
