@@ -26,10 +26,23 @@ The APK is only ever built by GitHub Actions (NDK 27.2.12479018), never here.
 | Runtime C compiles for `GAME_FC2` | `clang -DGAME_FC2 -std=gnu11 -O1 -fsyntax-only` with the vendored DX VK/SDL include dirs on all `runtime/*.c` | 0 errors |
 | Runtime C++ compiles for `GAME_FC2` | `clang++ -DGAME_FC2 -DDXVK_NATIVE -std=c++17 -fsyntax-only` on all `runtime/*.cpp` | 0 errors |
 | The lifted table matches the runtime's expectations | `gen/*_table.c` + `funcs_*.h` consumed by `runtime/modules.c`; the app-only stubs in `ci/gen_stub/` follow the same shape | compiles; only real runs will exercise them |
+| Every import of all three modules resolves | `python3 tools/import_coverage.py "…/Far Cry 2"` (reads the PE import tables and the runtime shim tables, including the CRT aliasing) | `farcry2.exe` 44 = 44 + 0; `Dunia.dll` 602 = 567 + 35 loud traps + **0 stubs**; `binkw32.dll` 91 = 91 + 0 |
+| The private-profile INI reader/writer | extracted `ini_get`/`ini_write` into a host test; create section, replace a value, insert into an existing section, second section, cross-section reads | all pass; file content as expected |
+| App-only APK | GitHub Actions run [40339818075](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40339818075), `.github/workflows/build.yml` with `gen/` absent (stub tables) | **success**; artifact `FarCry2-apk`, 2,114,082 bytes |
+| adrenotools' generated `bcenabler_patch.h` | assembled `src/bcenabler_patch.s` with `clang --target=aarch64-linux-gnu` + `llvm-objcopy` and compared with upstream | 264 bytes, byte-identical |
 
 Note the `-mtune=cortex-a73` in the CI compile options is not valid for the
 local x86 clang, so the local sample pass omits it; the NDK clang used in CI
 accepts it.
+
+## CI history (all from the public repo)
+
+| Run | Result | What it found |
+|---|---|---|
+| [40337075327](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40337075327) | failure | `Fc2LauncherActivity.java`: `driverList` used without a field declaration |
+| [40337581868](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40337581868) | failure | `adrenotools/src/bcenabler.cpp:10`: `gen/bcenabler_patch.h` not found |
+| [40338447334](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40338447334) | **success** | app-only APK built and uploaded (`FarCry2-apk`, 2,106,960 bytes) |
+| [40339818075](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40339818075) | **success** | app-only APK built after the remaining-import shims (`FarCry2-apk`, 2,114,082 bytes) |
 
 ## Implemented but not tested
 
@@ -38,18 +51,17 @@ accepts it.
 | The whole runtime under `GAME_FC2` | compiles, but nothing has run it |
 | Host D3DX9 (`runtime/d3dx9_host.cpp`, 15 entry points) | compiles; no game run has requested a texture |
 | D3D9 bridge over DXVK, DirectSound over SDL2, DInput/XInput, touch overlay | compiles; no device |
-| `fc2_shims.c` MSVCR80/MSVCP80 shims beyond `basic_string` | compiles; the game has not been observed calling most of them |
-| Android launcher (folder validation, size/SHA-1 check, options UI) | Java is compiled only by the CI Android build; never installed |
+| `fc2_shims.c` shims added for the remaining imports (`VirtualQuery`, the file-search W calls, `wsprintfA`, `GetKeyState`, the private-profile INI, `SHGetFolderPathW`, `std::exception`, …) | compiles; the game has not been observed calling them |
+| Android launcher (folder validation, size/SHA-1 check, options UI) | Java compiles in CI; the APK has never been installed |
 | `farcry2.exe` → `Dunia!RunGame` on a device | the point of the whole port; not reached |
-| App-only CI APK | the workflow is written; the run is pending |
-| Full APK | needs `gen/` in a private repo; the run is pending |
+| Full APK (with `gen/`) | needs `gen/` in a private repo; not attempted |
 
 ## Not implemented / blocked
 
 | What | Reason |
 |---|---|
 | **SEH and C++ exceptions** | `_except_handler3`, `_except_handler4_common`, `__CxxFrameHandler3`, `_CxxThrowException` are trapped with an abort. Any structured exception or `throw` stops the game. Top risk for the main-menu target. |
-| **MSVCP80 iostreams / stringstreams** | 40+ entry points registered as `NULL`; the first call aborts with its mangled name. |
+| **MSVCP80 iostreams / stringstreams** | 35 entry points registered as `NULL`; the first call aborts with its mangled name. `basic_string`, `char_traits` and `std::exception` are implemented. |
 | **Network** | Winsock/WinHTTP/WinINet/Secur32/Crypt32 are offline stubs. |
 | **DXT mip filtering** | `D3DXFilterTexture` creates the chain without filtering (logged). |
 | **`D3DXSaveTextureToFileInMemory`** | returns `E_NOTIMPL`. |

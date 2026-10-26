@@ -23,9 +23,11 @@ and the shared runtime structure (which those projects also share).
 | Function discovery (`Dunia.dll`, 14.1 MB of code) | **Done**: 82,403 functions, 95.5 % coverage |
 | x86 → C lifting of all three modules | **Done**: 82,643 functions lifted, 259 rejected |
 | Runtime (`runtime/`, CRT/Win32/D3D9/DSound/input shims) | **Written**, compiles for `GAME_FC2` on a host |
+| Import resolution of the three modules | **Done**: every import resolves (`tools/import_coverage.py`); 0 abort stubs |
 | Host D3DX9 (`runtime/d3dx9_host.cpp`, 15 imports) | **Written**, compiles; not exercised by a game run |
-| Android launcher + activity | **Written**, never built or installed |
-| APK | **Only built by GitHub Actions**; see the Actions tab. Not built at the time of writing |
+| Android launcher + activity | **Written**, compiles in CI |
+| APK (app-only, stub tables) | **Built by GitHub Actions**, run [40338447334](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40338447334): `FarCry2-apk`, 2,106,960 bytes |
+| APK (full, with `gen/`) | Not built: needs the private `GEN_REPO`/`GEN_TOKEN` setup in the README |
 | Game on a phone | **Not tested**. Nothing has run on an arm64 device yet |
 | SEH / C++ exceptions | **Not implemented** — top blocker, see below |
 
