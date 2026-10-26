@@ -7,28 +7,42 @@ Local machine for everything below: Ubuntu 24.04 dev container, x86_64,
 4 cores / 16 GB, clang 18.1.3, Python 3.12, capstone 5.0.7, pefile 2024.8.26.
 The APK is only ever built by GitHub Actions (NDK 27.2.12479018), never here.
 
+The host runs use the same runtime and the same recompiled code as the APK:
+`desktop/build.sh` produces `build/lb`, and `desktop/run_headless.sh` runs it
+under Xvfb with Mesa lavapipe (no GPU) and DXVK's native `d3d9`.
+
 ## Tested and working
 
 | What | How | Result |
 |---|---|---|
-| PE facts for `farcry2.exe`, `Dunia.dll`, `binkw32.dll`, `FC2.dll` | `pefile` walk of headers, sections, imports, exports, relocations, version resources; `sha1sum` | every number in `docs/RECON.md` §1–§6 |
+| PE facts for `farcry2.exe`, `Dunia.dll`, `binkw32.dll`, `systemdetection.dll`, `FC2.dll` | `pefile` walk of headers, sections, imports, exports, relocations, version resources; `sha1sum` | every number in `docs/RECON.md` §1–§6 |
 | DRM classification | imports, section names, entropy, overlay, PDB paths | `FC2.dll` = SecuROM Activate & Play 1.0.1.10; nothing imports it; GOG boot path is DRM-free |
 | Boot path of `farcry2.exe` | `capstone` 32-bit disassembly of `.text` | entry `0x4014ec` → cookie init `0x401840` → CRT startup `0x40122b` → `0x4011b0`; 15 `AddFunctionCB` registrations (12 distinct stubs, names in `.rdata`); `Dunia!RunGame` at `0x4011c5` (`docs/RECON.md` §3) |
 | D3DX9 / D3D9 / DInput / DSound / XInput / Bink imports | import-table extraction | 15 D3DX9 entries, `Direct3DCreate9`, `DirectInput8Create`, DSOUND `#11`/`#2`, `EAX.DLL #6`, Bink 1.9a |
 | Function discovery, `Dunia.dll` (14.1 MB of code) | `python3 tools/discover.py .../Dunia.dll analysis/functions_dunia.json 10000000` | 82,403 functions, 857 jump tables, 1,512 unresolved indirect jumps, 6,423 bad data roots, 95.5 % coverage, 724 s wall, 2,075 MB peak RSS |
 | Function discovery, `binkw32.dll` | same | 447 functions, 14 jump tables, 42 indirect jumps |
 | Function discovery, `farcry2.exe` | same | 52 functions |
+| Function discovery, `systemdetection.dll` | same, rebased `12000000` | 1,299 functions, 46 jump tables, 11 indirect jumps, 368 bad data roots, 173,534 of 179,264 bytes covered (**96.8 %**) |
 | Lifting, `Dunia.dll` | `LIFT_FILES=384 python3 tools/lift.py ...` | 82,149 lifted, 254 rejected |
 | Lifting, `binkw32.dll` | `LIFT_FILES=24 ...` | 442 lifted, 5 rejected |
-| Lifting, `farcry2.exe` | `LIFT_FILES=256 ...` | 52 lifted, 0 rejected |
-| Lifted C is valid C | `clang -DGAME_FC2 -std=gnu11 -fsyntax-only -Iruntime -Igen -w` on **all 427** `gen/*.c` (384 dunia + 24 bink + 16 fc2 + 3 tables) | 0 failures (log ended with `ALLDONE`, empty failure list) |
+| Lifting, `farcry2.exe` | `LIFT_FILES=256 ...` | 52 lifted, 0 rejected, 46 of 256 files non-empty |
+| Lifting, `systemdetection.dll` | `LIFT_FILES=24 ...` | 1,297 lifted, 2 rejected |
+| Lifted C is valid C | `clang -DGAME_FC2 -std=gnu11 -fsyntax-only -fno-strict-aliasing -fwrapv -fsigned-char -Iruntime -Igen -w` on **all 692** `gen/*.c` (current set: 384 dunia + 256 fc2 + 24 bink + 24 sdet + 4 tables) | 0 failures (log contained only `ALLDONE`) |
+| The lifted code references only symbols the runtime provides | `grep -rhoE '\brt_[A-Za-z0-9_]+' gen/ | sort -u`, each checked against `runtime/` | 9 symbols (`rt_call`, `rt_cpuid`, `rt_int3`, `rt_movsd`, `rt_rdtsc`, `rt_setjmp3`, `rt_setjmp_slot`, `rt_unimpl`, plus the `rt_table.h` include) — all defined; the temporary `rt_dbg` debug helper is gone, which would otherwise have failed the link |
 | Lifted C compiles at the CI flags | `clang -DGAME_FC2 -std=gnu11 -O1 -g0 -fno-strict-aliasing -fwrapv -fsigned-char -w -fPIC -c` on 8 files including the largest (`gen/dunia_329.c`) | all succeed; largest file 34 s, medium 25 s, small 0–5 s on this 4-core x86 host |
 | Runtime C compiles for `GAME_FC2` | `clang -DGAME_FC2 -std=gnu11 -O1 -fsyntax-only` with the vendored DX VK/SDL include dirs on all `runtime/*.c` | 0 errors |
 | Runtime C++ compiles for `GAME_FC2` | `clang++ -DGAME_FC2 -DDXVK_NATIVE -std=c++17 -fsyntax-only` on all `runtime/*.cpp` | 0 errors |
 | The lifted table matches the runtime's expectations | `gen/*_table.c` + `funcs_*.h` consumed by `runtime/modules.c`; the app-only stubs in `ci/gen_stub/` follow the same shape | compiles; only real runs will exercise them |
-| Every import of all three modules resolves | `python3 tools/import_coverage.py "…/Far Cry 2"` (reads the PE import tables and the runtime shim tables, including the CRT aliasing) | `farcry2.exe` 44 = 44 + 0; `Dunia.dll` 602 = 567 + 35 loud traps + **0 stubs**; `binkw32.dll` 91 = 91 + 0 |
+| Every import of all four modules resolves | `python3 tools/import_coverage.py "…/Far Cry 2"` (reads the PE import tables and the runtime shim tables, including the CRT aliasing and ordinal imports) | `farcry2.exe` 44 = 44; `Dunia.dll` 602 = 602; `binkw32.dll` 91 = 91; `systemdetection.dll` 140 = 140 — 0 loud traps, 0 abort stubs |
 | The private-profile INI reader/writer | extracted `ini_get`/`ini_write` into a host test; create section, replace a value, insert into an existing section, second section, cross-section reads | all pass; file content as expected |
 | App-only APK | GitHub Actions run [40339818075](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40339818075), `.github/workflows/build.yml` with `gen/` absent (stub tables) | **success**; artifact `FarCry2-apk`, 2,114,082 bytes |
+| `gen.tar.zst` round trip | built with `tar --use-compress-program='zstd -T4 -3' -cf gen.tar.zst gen`, published as a release asset of the private `deivid22srk/FarCry2_gen`, then downloaded and extracted exactly as `build.yml` does (`gh release download gen-v1 --pattern gen.tar.zst` + `tar --use-compress-program=unzstd -xf ... -C .`) | 25,370,685 bytes, sha256 `a767d069…ca21`, 692 `.c` + 4 `funcs_*.h`, 288 MB extracted, `sha256sum -c` OK |
+| Full APK (with the real `gen/`) | GitHub Actions run [40377549175](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40377549175) (`GEN_REPO`/`GEN_TAG`/`GEN_TOKEN` set) | **success** in 11m49s; step log `recompiled files: 692`, `gen/ present: building the full APK (692 C files)`; `FarCry2.apk` 45,540,586 bytes, sha256 `39b15558…24ed` |
+| The full APK contains the recompiled code and only `arm64-v8a` | downloaded the private release asset, `unzip -l`, `file`, `strings` | `lib/arm64-v8a/libmain.so` 109,747,328 bytes, ELF aarch64 (stripped); module names `Dunia.dll`, `binkw32.dll`, `systemdetection.dll` present; **no game data** in the APK |
+| The APK is published privately, not here | run log + the public repo's artifact list | release `apk-5-20261026-1836` in `deivid22srk/FarCry2_gen`; the public repo has no APK artifact for this run |
+| Host boot of the game | `desktop/build.sh` then `desktop/run_headless.sh "<game dir>"` (Xvfb + Mesa lavapipe + DXVK's native d3d9) on the user's own GOG copy | executes `farcry2.exe` → `Dunia.dll!RunGame`, loads `Dunia.dll`/`binkw32.dll`/`systemdetection.dll`, `CreateWindowExA 'Dunia'`, `WM_ACTIVATEAPP`, DirectSound8, D3D9 device + swap chain (DXVK), many `CreateTexture`, `Reset 1024x576`, then the `PeekMessageA`/`QueryPerformanceCounter` loop |
+| Host run, where it stops | same, plus `gdb` (break on the screen constructor, hardware watchpoint on `[obj+0x14]`) | the engine activates `MAINMENU_INITIAL_RATING` and reads `[screen+0x14]` (the UI-element root) as `NULL`; the watchpoint never fires, so nothing ever writes the field; `f_10CA2220` → `f_10A86DD0` faults at guest `0x58` |
+| The full APK on a real phone | the user installed the build #5 APK — the private release `apk-5-20261026-1836` from run [40377549175](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40377549175) — on their Motorola Edge 30 Fusion (Android 14, Adreno 660) and ran it | the launcher opened and accepted the game folder, and `farcry2.exe` → `Dunia!RunGame` booted on the phone to the same point as the host run — the render loop — then died in the same UI init. This is the user's report from their own phone; the dev machine has no `adb` access to it, so no screenshot or `logcat` was captured |
 | adrenotools' generated `bcenabler_patch.h` | assembled `src/bcenabler_patch.s` with `clang --target=aarch64-linux-gnu` + `llvm-objcopy` and compared with upstream | 264 bytes, byte-identical |
 
 Note the `-mtune=cortex-a73` in the CI compile options is not valid for the
@@ -43,30 +57,35 @@ accepts it.
 | [40337581868](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40337581868) | failure | `adrenotools/src/bcenabler.cpp:10`: `gen/bcenabler_patch.h` not found |
 | [40338447334](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40338447334) | **success** | app-only APK built and uploaded (`FarCry2-apk`, 2,106,960 bytes) |
 | [40339818075](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40339818075) | **success** | app-only APK built after the remaining-import shims (`FarCry2-apk`, 2,114,082 bytes) |
+| [40377549175](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40377549175) | **success** | first **full** APK: downloaded `gen.tar.zst` (692 C files) from the private `FarCry2_gen` release, built `FarCry2.apk` (45,540,586 bytes) and published it as a private release there |
 
 ## Implemented but not tested
 
 | What | Why not |
 |---|---|
-| The whole runtime under `GAME_FC2` | compiles, but nothing has run it |
-| Host D3DX9 (`runtime/d3dx9_host.cpp`, 15 entry points) | compiles; no game run has requested a texture |
-| D3D9 bridge over DXVK, DirectSound over SDL2, DInput/XInput, touch overlay | compiles; no device |
-| `fc2_shims.c` shims added for the remaining imports (`VirtualQuery`, the file-search W calls, `wsprintfA`, `GetKeyState`, the private-profile INI, `SHGetFolderPathW`, `std::exception`, …) | compiles; the game has not been observed calling them |
-| Android launcher (folder validation, size/SHA-1 check, options UI) | Java compiles in CI; the APK has never been installed |
-| `farcry2.exe` → `Dunia!RunGame` on a device | the point of the whole port; not reached |
-| Full APK (with `gen/`) | needs `gen/` in a private repo; not attempted |
+| Most of the runtime under `GAME_FC2` | the host run boots the game, but it stops at the first screen, so anything past the UI init is unexercised |
+| Host D3DX9 (`runtime/d3dx9_host.cpp`, 15 entry points) | texture creation is observed, but no entry point's *output* has been compared against the original |
+| D3D9 bridge over DXVK, DirectSound over SDL2 | exercised on the host and, on the phone, up to the same crash; what the device actually rendered was never captured or compared |
+| DInput/XInput, touch overlay | not exercised on the host or on the phone |
+| Some `fc2_shims.c` shims (`VirtualQuery`, the file-search W calls, `wsprintfA`, `GetKeyState`, …) | compile; the host run is not known to have called them |
+| Android launcher options UI (resolution, extras) | the install and the folder validation ran on the phone (see above); the options screen itself was not exercised |
+| Any frame on the phone past the first screen | the device run dies in the same UI init as the host, so the menus and everything after are still unexercised |
+| Android-only paths in `runtime/kernel32.c` (`/proc` affinity, `singlecore.txt`) | `#ifdef __ANDROID__` code the host build never compiles |
 
 ## Not implemented / blocked
 
 | What | Reason |
 |---|---|
-| **SEH and C++ exceptions** | `_except_handler3`, `_except_handler4_common`, `__CxxFrameHandler3`, `_CxxThrowException` are trapped with an abort. Any structured exception or `throw` stops the game. Top risk for the main-menu target. |
-| **MSVCP80 iostreams / stringstreams** | 35 entry points registered as `NULL`; the first call aborts with its mangled name. `basic_string`, `char_traits` and `std::exception` are implemented. |
+| **The screen's UI-element tree is never built** | the current blocker for the main-menu target: `[screen+0x14]` stays `NULL` (see the host-run rows above); root cause not identified yet |
+| **SEH and C++ exceptions** | `_except_handler3`, `_except_handler4_common`, `__CxxFrameHandler3`, `_CxxThrowException` are trapped with an abort. Any structured exception or `throw` stops the game. |
+| **MSVCP80 entry points outside the implemented subset** | the iostream/stringstream subset the engine uses is implemented; anything else still aborts with its mangled name. |
 | **Network** | Winsock/WinHTTP/WinINet/Secur32/Crypt32 are offline stubs. |
 | **DXT mip filtering** | `D3DXFilterTexture` creates the chain without filtering (logged). |
 | **`D3DXSaveTextureToFileInMemory`** | returns `E_NOTIMPL`. |
-| **1,512 unresolved indirect jumps in Dunia** | calls through them abort at the target address; each one is a possible gap. |
-| **Running on an arm64 device** | no device was available; nothing in this port has executed a frame of the game. |
-| **Building the APK locally** | deliberately not done: no SDK/NDK/Gradle is installed here, and the project rule is that the APK comes only from Actions. |
-| **Publishing the APK** | requires the private `GEN_REPO` setup described in the README; not done at the time of writing. |
+| **1,512 unresolved indirect jumps in Dunia** | calls through them abort at the target address; each one is a possible gap. Same for `binkw32.dll` (42) and `systemdetection.dll` (11). |
+| **Eight documented fallbacks** | `UpdateLayeredWindow`, `WSAStartup`, `socket`, `gethostbyname`, `AcquireCredentialsHandleA`, `CryptGenRandom`, `EnumDisplayDevicesA`, `EAXDirectSoundCreate8` log once and return a fixed failure value. |
+| **`systemdetection.dll`'s WMI path** | `CLSID_WbemLocator` is not provided; the DxDiag/D3D9 path is what answers. |
+| **Bink imports from Dunia** | `binkw32.dll` loads after its importer, so Dunia's IAT slots for it are bound to abort stubs; no `_Bink*` call has been hit yet, i.e. video playback has not been reached. |
+| **Reaching the main menu anywhere** | neither the host nor the phone run gets past the first screen's UI init, so the minimum acceptance target is still unmet. |
+| **Building the APK locally** | deliberately not done: the project rule is that the APK comes only from Actions. |
 | **`d3dx9_38.dll`, `FC2.dll` redistribution** | neither is shipped or recompiled (`FC2.dll` is DRM; `d3dx9_38` is Microsoft's). |

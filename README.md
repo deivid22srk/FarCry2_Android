@@ -22,18 +22,46 @@ and the shared runtime structure (which those projects also share).
 | Boot path disassembly (exe → `Dunia.dll!RunGame`) | **Done**, `docs/RECON.md` §3 |
 | Function discovery (`Dunia.dll`, 14.1 MB of code) | **Done**: 82,403 functions, 95.5 % coverage |
 | x86 → C lifting of all four modules | **Done**: 83,940 functions lifted, 261 rejected |
-| Runtime (`runtime/`, CRT/Win32/D3D9/DSound/input shims) | **Written**, compiles for `GAME_FC2` on a host |
+| Runtime (`runtime/`, CRT/Win32/D3D9/DSound/input shims) | **Written** and executed: it boots the game on a host and reaches the render loop (see *First execution* below) |
 | Import resolution of the four modules | **Done**: every import resolves (`tools/import_coverage.py`); 0 unregistered imports, 0 abort stubs |
-| Host D3DX9 (`runtime/d3dx9_host.cpp`, 15 imports) | **Written**, compiles; not exercised by a game run |
+| Host D3DX9 (`runtime/d3dx9_host.cpp`, 15 imports) | **Written**, compiles; exercised by the host run (texture creation observed) |
 | Android launcher + activity | **Written**, compiles in CI |
 | APK (app-only, stub tables) | **Built by GitHub Actions**, run [40338447334](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40338447334): `FarCry2-apk`, 2,106,960 bytes |
-| APK (full, with `gen/`) | Not built: needs the private `GEN_REPO`/`GEN_TOKEN` setup in the README |
-| Game on a phone | **Not tested**. Nothing has run on an arm64 device yet |
+| APK (full, with `gen/`) | **Built by GitHub Actions**, run [40377549175](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40377549175): 45,540,586 bytes, `arm64-v8a`, `libmain.so` 109,747,328 bytes. Published as a **private** release asset in [`deivid22srk/FarCry2_gen`](https://github.com/deivid22srk/FarCry2_gen) (`apk-5-20261026-1836`), never here |
+| Game on a phone | **Partially working**: the full APK installs on a real arm64 phone (Motorola Edge 30 Fusion, Android 14, Adreno 660), the launcher opens the game folder, and the game boots to its render loop — then it dies in the same UI init as the host run |
+| Game on the host (desktop harness) | **Partially working**: boots to the engine's render loop, then dies in the UI init of the first screen (details below) |
 | SEH / C++ exceptions | **Not implemented** — top blocker, see below |
 
 The minimum acceptance target for this project is: APK installs, the launcher
-validates the game folder, and the game reaches its main menu. That target has
-not been reached.
+validates the game folder, and the game reaches its main menu. **The first two
+are met** (the user installed and ran the full APK on their own phone); the third is not.
+
+### First execution (host, not the APK)
+
+`desktop/build.sh` builds `build/lb`: the same runtime plus the recompiled code
+as a Linux binary. `desktop/run.sh "<game dir>"` runs the game in place, and
+`desktop/run_headless.sh` does the same under Xvfb + Mesa lavapipe for a machine
+with no display or GPU.
+
+What has been observed, running the user's own GOG copy:
+
+* the boot path: `farcry2.exe` → `Dunia.dll!RunGame`, Dunia loading and
+  resolving `binkw32.dll` and `systemdetection.dll`;
+* `CreateWindowExA 'Dunia'`, `WM_ACTIVATEAPP`, DirectSound8 (SDL2), the D3D9
+  device and swap chain through DXVK, many `CreateTexture`, `Reset 1024x576`,
+  then the `PeekMessageA` / `QueryPerformanceCounter` main loop.
+
+Where it stops (see `docs/TESTED.md` for the commands and the gdb evidence): the
+engine activates its first screen, `MAINMENU_INITIAL_RATING`, and dereferences
+`[screen+0x14]` — the root of that screen's UI-element tree — which is still
+`NULL`. A hardware watchpoint on the field, armed when the screen object is
+constructed, never fires: no code in the process ever writes it, so whatever is
+supposed to build the screen's elements never runs. `f_10CA2220` then calls
+`f_10A86DD0` with the `NULL` and the fault lands at guest address `0x58`.
+
+Everything the run touched is listed in `docs/TESTED.md`; the pieces that abort
+loudly (SEH/C++ unwinding, unresolved indirect jumps, Bink imports) have not been
+hit yet.
 
 ## What it does
 

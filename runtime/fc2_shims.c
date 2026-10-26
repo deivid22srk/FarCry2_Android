@@ -397,6 +397,18 @@ SHIM(tr_move_s) {
     memmove(GPTR(ARG(0)), GPTR(ARG(2)), ARG(3));
     RETC(ARG(0));
 }
+/* char_traits<unsigned short> counts elements, not bytes (VC8's _Copy_s/_Move_s
+ * multiply the count by sizeof(_Elem) = 2). Sharing the narrow shims here used to
+ * copy half of every wide string, so every std::wstring longer than the 8-element
+ * small-string buffer came out with a stale tail. */
+SHIM(tr_copy_s_w) {
+    memcpy(GPTR(ARG(0)), GPTR(ARG(2)), 2u * ARG(3));
+    RETC(ARG(0));
+}
+SHIM(tr_move_s_w) {
+    memmove(GPTR(ARG(0)), GPTR(ARG(2)), 2u * ARG(3));
+    RETC(ARG(0));
+}
 SHIM(tr_xlen) { rt_fatal("std::string length_error (_Xlen) reached"); }
 SHIM(tr_xran) { rt_fatal("std::string out_of_range (_Xran) reached"); }
 
@@ -1700,9 +1712,9 @@ static const ShimDef defs[] = {
     {"msvcp80.dll", "?compare@?$char_traits@D@std@@SAHPBD0I@Z", shim_tr_compare},
     {"msvcp80.dll", "?find@?$char_traits@D@std@@SAPBDPBDIABD@Z", shim_tr_find},
     {"msvcp80.dll", "?_Copy_s@?$char_traits@D@std@@SAPADPADIPBDI@Z", shim_tr_copy_s},
-    {"msvcp80.dll", "?_Copy_s@?$char_traits@G@std@@SAPAGPAGIPBGI@Z", shim_tr_copy_s},
+    {"msvcp80.dll", "?_Copy_s@?$char_traits@G@std@@SAPAGPAGIPBGI@Z", shim_tr_copy_s_w},
     {"msvcp80.dll", "?_Move_s@?$char_traits@D@std@@SAPADPADIPBDI@Z", shim_tr_move_s},
-    {"msvcp80.dll", "?_Move_s@?$char_traits@G@std@@SAPAGPAGIPBGI@Z", shim_tr_move_s},
+    {"msvcp80.dll", "?_Move_s@?$char_traits@G@std@@SAPAGPAGIPBGI@Z", shim_tr_move_s_w},
     {"msvcp80.dll", "?_Xlen@_String_base@std@@SAXXZ", shim_tr_xlen},
     {"msvcp80.dll", "?_Xran@_String_base@std@@SAXXZ", shim_tr_xran},
     {"msvcp80.dll", "?good@ios_base@std@@QBE_NXZ", shim_ios_good},

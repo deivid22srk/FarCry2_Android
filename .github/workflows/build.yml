@@ -27,7 +27,7 @@ on:
         default: "3"
   push:
     branches: [main]
-    paths-ignore: ["**.md", "docs/**"]
+    paths-ignore: ["**.md", "docs/**", "desktop/**"]
 
 jobs:
   apk:
