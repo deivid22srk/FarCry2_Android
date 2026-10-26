@@ -1,0 +1,2 @@
+rootProject.name = 'FarCry2_Android'
+include ':app'

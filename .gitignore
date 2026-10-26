@@ -1,0 +1,56 @@
+# --- game files: never versioned -------------------------------------------
+# The user's own copy of the game is never part of this repository.
+*.exe
+*.dll
+*.asi
+*.zip
+*.7z
+*.rar
+*.iso
+*.bin
+*.bik
+*.WBK
+*.PAK
+*.usm
+*.dat
+Game*/
+game/
+# the working copy of the game and the reference ports, kept outside git
+/fc2/
+/fc2.rar
+# ...except the build glue for the recompiled code (not a game file):
+!android/app/jni/game/
+!android/app/jni/game/CMakeLists.txt
+Ultimate_Spider_Man*/
+Data/
+data/
+
+# --- generated from the game: never versioned ------------------------------
+# gen/ is recompiled machine code derived from the user's own copy of Far Cry 2
+# (farcry2.exe, Dunia.dll, binkw32.dll). Never commit or publish it.
+gen/
+analysis/
+*.o
+*.a
+*.so
+build/
+desktop/build/
+
+# --- android ---------------------------------------------------------------
+.gradle/
+local.properties
+android/.idea/
+android/app/build/
+android/build/
+*.apk
+*.aab
+*.keystore
+*.jks
+.cxx/
+
+# --- misc ------------------------------------------------------------------
+__pycache__/
+*.pyc
+port/
+log.txt
+.DS_Store

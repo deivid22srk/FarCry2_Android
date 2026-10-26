@@ -1,0 +1,70 @@
+apply plugin: 'com.android.application'
+
+/* Release signing. There is no keystore in this repository (unlike the
+ * reference port, whose certificate belongs to that project). A CI run signs
+ * with a throwaway debug key unless KEYSTORE_BASE64 / KEYSTORE_PASSWORD /
+ * KEY_ALIAS / KEY_PASSWORD are configured in the workflow. */
+def fc2Keystore = System.getenv("FC2_KEYSTORE") ?: project.findProperty("fc2Keystore")
+def fc2StoreType = System.getenv("FC2_KEYSTORE_TYPE") ?: "PKCS12"
+def fc2StorePass = System.getenv("FC2_STORE_PASSWORD") ?: project.findProperty("fc2StorePassword")
+def fc2KeyAlias = System.getenv("FC2_KEY_ALIAS") ?: project.findProperty("fc2KeyAlias")
+def fc2KeyPass = System.getenv("FC2_KEY_PASSWORD") ?: project.findProperty("fc2KeyPassword")
+
+android {
+    namespace "com.deivid22srk.fc2"
+    compileSdkVersion 34
+    ndkVersion project.hasProperty('ndkVersion') ? project.property('ndkVersion') : null
+    defaultConfig {
+        applicationId "com.deivid22srk.fc2"
+        minSdkVersion 28
+        targetSdkVersion 29  // legacy storage: plain file access with the normal storage prompt
+        versionCode project.hasProperty('fc2VersionCode') ? project.property('fc2VersionCode').toInteger() : 1
+        versionName project.hasProperty('fc2VersionName') ? project.property('fc2VersionName') : "0.1"
+        externalNativeBuild {
+            cmake {
+                arguments "-DANDROID_STL=c++_shared", "-DANDROID_PLATFORM=android-28",
+                        "-DLB_GEN_JOBS=" + (project.findProperty('lbGenJobs') ?: '3')
+                abiFilters 'arm64-v8a'
+            }
+        }
+    }
+    signingConfigs {
+        if (fc2Keystore) {
+            release {
+                storeFile file(fc2Keystore)
+                storeType fc2StoreType
+                storePassword fc2StorePass
+                keyAlias fc2KeyAlias
+                keyPassword fc2KeyPass
+            }
+        }
+    }
+    buildTypes {
+        // The recompiled game is large; debug builds would be unusably slow.
+        debug {
+            externalNativeBuild { cmake { arguments "-DCMAKE_BUILD_TYPE=Release" } }
+            debuggable true
+            jniDebuggable false
+        }
+        release {
+            minifyEnabled false
+            // The fixed release key when one is configured, the throwaway debug
+            // key otherwise (local builds only: CI always passes a keystore).
+            signingConfig fc2Keystore ? signingConfigs.release : signingConfigs.debug
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path 'jni/CMakeLists.txt'
+            version '3.22.1'
+        }
+    }
+    packagingOptions {
+        jniLibs { useLegacyPackaging true }
+    }
+    lint { abortOnError false }
+}
+
+dependencies {
+    implementation fileTree(include: ['*.jar'], dir: 'libs')
+}

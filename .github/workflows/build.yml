@@ -1,0 +1,148 @@
+name: build
+
+# The APK is only ever built here, never on a developer machine.
+#
+# Two modes, chosen by the repository variable GEN_REPO:
+#
+#   full      GEN_REPO set (e.g. deivid22srk/FarCry2_gen): the workflow downloads
+#             gen.tar.zst from that *private* repository's release GEN_TAG using
+#             the GEN_TOKEN secret, builds the real APK (recompiled game code
+#             included) and publishes it as an asset of a *private* release in
+#             GEN_REPO. No game code ever reaches this public repository or its
+#             artifacts.
+#
+#   app-only  GEN_REPO unset: builds the launcher + runtime against
+#             ci/gen_stub (empty tables). Installs and validates the game folder;
+#             Play stops with a clear message. Uploaded as a public artifact.
+#
+# gen/ is derived from the game and must never be committed, released or
+# uploaded here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      lb_gen_jobs:
+        description: "Parallel compiles of recompiled files (RAM: ~1.5 GB each)"
+        required: false
+        default: "3"
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    # gen/ is ~283 MB of C in 384 files; at -O1 that is roughly 1 h with three
+    # parallel compiles, plus DXVK/SDL. Keep a wide margin.
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: >-
+            platforms;android-34
+            build-tools;34.0.0
+            cmake;3.22.1
+            ndk;27.2.12479018
+
+      - name: Toolchain versions
+        run: |
+          java -version
+          ls "$ANDROID_HOME/ndk"
+          cmake --version | head -1
+          free -m
+
+      - name: Fetch recompiled game code (private repository)
+        if: ${{ vars.GEN_REPO != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GEN_TOKEN }}
+          GEN_REPO: ${{ vars.GEN_REPO }}
+          GEN_TAG: ${{ vars.GEN_TAG }}
+        run: |
+          set -euo pipefail
+          test -n "${GH_TOKEN:-}" || { echo "GEN_TOKEN secret is missing"; exit 1; }
+          echo "fetching $GEN_TAG from $GEN_REPO"
+          gh release download "$GEN_TAG" --repo "$GEN_REPO" \
+            --pattern 'gen.tar.zst' --output gen.tar.zst --clobber
+          ls -l gen.tar.zst
+          rm -rf gen && mkdir gen
+          tar --use-compress-program=unzstd -xf gen.tar.zst -C .
+          rm -f gen.tar.zst
+          echo "recompiled files: $(ls gen/*.c | wc -l)"
+          du -sh gen
+
+      - name: Use stub tables when gen/ is absent
+        run: |
+          if [ -z "$(ls -A gen 2>/dev/null)" ]; then
+            mkdir -p gen
+            cp ci/gen_stub/* gen/
+            echo "gen/ absent: building the app-only APK"
+          else
+            echo "gen/ present: building the full APK ($(ls gen/*.c | wc -l) C files)"
+          fi
+
+      - name: Build APK
+        working-directory: android
+        env:
+          LB_GEN_JOBS: ${{ inputs.lb_gen_jobs }}
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug \
+            -PndkVersion=27.2.12479018 \
+            -PlbGenJobs="${LB_GEN_JOBS:-3}"
+
+      - name: Collect artifact
+        run: |
+          mkdir -p out
+          cp android/app/build/outputs/apk/debug/app-debug.apk out/FarCry2.apk
+          ls -l out
+          sha256sum out/FarCry2.apk | tee out/FarCry2.apk.sha256
+
+      # Full build: the APK is published to the private repository, never here.
+      - name: Publish APK to the private repository
+        if: ${{ vars.GEN_REPO != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GEN_TOKEN }}
+          GEN_REPO: ${{ vars.GEN_REPO }}
+        run: |
+          set -euo pipefail
+          tag="apk-${GITHUB_RUN_NUMBER}-$(date -u +%Y%m%d-%H%M)"
+          sha="$(cut -d' ' -f1 out/FarCry2.apk.sha256)"
+          gh release create "$tag" out/FarCry2.apk \
+            --repo "$GEN_REPO" \
+            --title "APK $tag" \
+            --notes "Built by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          sha256: $sha
+          Install on arm64 Android 9+ and point the launcher at your own copy of Far Cry 2."
+          echo "published to https://github.com/$GEN_REPO/releases/tag/$tag"
+          {
+            echo "### Full APK built"
+            echo ""
+            echo "Download: https://github.com/$GEN_REPO/releases/tag/$tag"
+            echo ""
+            echo "sha256: \`$sha\`"
+            echo ""
+            echo "It is a **private** release on purpose: the APK contains the recompiled"
+            echo "game code, so it never appears as an artifact of this public repository."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # App-only build: safe to hand out publicly (contains no game code).
+      - uses: actions/upload-artifact@v4
+        if: ${{ vars.GEN_REPO == '' }}
+        with:
+          name: FarCry2-apk
+          path: |
+            out/FarCry2.apk
+            out/FarCry2.apk.sha256
+          if-no-files-found: error
