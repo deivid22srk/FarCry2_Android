@@ -28,8 +28,8 @@ data/
 # --- generated from the game: never versioned ------------------------------
 # gen/ is recompiled machine code derived from the user's own copy of Far Cry 2
 # (farcry2.exe, Dunia.dll, binkw32.dll). Never commit or publish it.
-gen/
-analysis/
+/gen/
+/analysis/
 *.o
 *.a
 *.so
