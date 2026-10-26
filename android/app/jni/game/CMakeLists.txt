@@ -1,5 +1,5 @@
 # The game: host runtime + recompiled code from runtime/ and gen/.
-# gen/ has ~82k lifted functions in 384 files; -O1 keeps the per-file compile
+# gen/ has ~82k lifted functions in 700 files; -O1 keeps the per-file compile
 # around 20-30 s on a runner while staying close to -O2 for this straight-line
 # code (the runtime itself is built at -O2).
 get_filename_component(PORT ${CMAKE_CURRENT_SOURCE_DIR}/../../../.. ABSOLUTE)

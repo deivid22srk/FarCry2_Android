@@ -32,7 +32,7 @@ on:
 jobs:
   apk:
     runs-on: ubuntu-latest
-    # gen/ is ~283 MB of C in 384 files; at -O1 that is roughly 1 h with three
+    # gen/ is ~288 MB of C in 700 files; at -O1 that is roughly 1-2 h with three
     # parallel compiles, plus DXVK/SDL. Keep a wide margin.
     timeout-minutes: 350
     permissions:
