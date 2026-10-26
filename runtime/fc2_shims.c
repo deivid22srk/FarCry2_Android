@@ -23,6 +23,7 @@
 #define _GNU_SOURCE
 #include "rt.h"
 #include <ctype.h>
+#include <errno.h>
 #include <string.h>
 #include <wctype.h>
 #include <strings.h>
@@ -30,6 +31,8 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <wchar.h>
+#include <stdarg.h>
+#include <sys/stat.h>
 
 void msvcrt_register_as_msvcr80(void);
 
@@ -552,6 +555,439 @@ SHIM(FindResourceA) { RET(0, 3); }
 SHIM(LockResource) { RET(ARG(0), 1); }
 
 /* ==================================================================== */
+/* imports the first boot of the game was observed to need             */
+/* (docs/RECON.md, "Known gaps": these used to abort)                   */
+/* ==================================================================== */
+
+/* UTF-16 guest string -> newly allocated ANSI guest string. */
+static uint32_t narrow_dup(uint32_t w) {
+    char buf[520];
+    size_t i = 0;
+    for (; w && i < sizeof buf - 1 && M16(w + 2 * i); i++) buf[i] = (char)M16(w + 2 * i);
+    buf[i] = 0;
+    return gstrdup(buf);
+}
+
+/* ---- MSVCR80: CRT entry points the shared table does not have -------- */
+/* _configthreadlocale(_ENABLE_PER_THREAD_LOCALE): 0 = the previous mode. */
+SHIM(_configthreadlocale) { RETC(0); }
+/* The CRT's invalid-parameter handler. In a real process it ends the
+ * process; there is nothing sensible to return to. */
+SHIM(_invoke_watson) {
+    rt_fatal("_invoke_watson: the CRT invalid-parameter handler was called");
+}
+SHIM(memchr) {
+    uint32_t n = ARG(2);
+    const void *r = n ? memchr(GPTR(ARG(0)), (int)(ARG(1) & 0xFF), n) : NULL;
+    RETC(r ? (uint32_t)((const uint8_t *)r - (const uint8_t *)MEM) : 0);
+}
+/* _itoa_s(value, buffer, sizeInChars, radix): 0 on success, EINVAL/ERANGE
+ * otherwise, lowercase digits, buffer emptied on failure. */
+SHIM(_itoa_s) {
+    uint32_t buf = ARG(1), size = ARG(2);
+    int32_t v = (int32_t)ARG(0), radix = (int32_t)ARG(3);
+    if (size) ((char *)MEM)[buf] = 0;
+    if (!buf || !size || radix < 2 || radix > 36) RETC(22);
+    char tmp[70];
+    int i = 0, neg = (radix == 10 && v < 0);
+    uint32_t u = neg ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
+    do { int d = (int)(u % (uint32_t)radix); tmp[i++] = (char)(d < 10 ? '0' + d : 'a' + d - 10); u /= (uint32_t)radix; } while (u);
+    if (neg) tmp[i++] = '-';
+    if ((uint32_t)i + 1 > size) { rt_set_last_error(c, 34); RETC(34); }  /* ERANGE */
+    for (int k = 0; k < i; k++) ((char *)MEM)[buf + k] = tmp[i - 1 - k];
+    RETC(0);
+}
+
+/* ---- MSVCP80: std::exception (VC8 layout) and the wide char_traits ----
+ * [0] vftable, [4] char *_Mywhat, [8] char _Mydofree. The copies are
+ * leaked: the game only builds these while unwinding, which stops anyway. */
+SHIM(exc_vcall) {
+    rt_fatal("std::exception virtual call: C++ unwinding is not implemented");
+}
+/* A one-slot guest vtable whose entry is a thunk that stops with the above
+ * message, so a virtual call through an exception object is diagnosable
+ * instead of jumping to address 0. */
+static uint32_t exc_vtable(void) {
+    static uint32_t vt;
+    if (!vt) {
+        vt = gmalloc(8);
+        if (vt) { M32(vt) = rt_thunk(shim_exc_vcall, "std::exception vtable"); M32(vt + 4) = 0; }
+    }
+    return vt;
+}
+SHIM(exc_ctor) {
+    uint32_t t = c->r[1];
+    M32(t) = exc_vtable();
+    M32(t + 4) = gstrdup("Unknown exception");
+    M8(t + 8) = 0;
+    RET(t, 0);
+}
+SHIM(exc_ctor_msg) {
+    uint32_t t = c->r[1], pp = ARG(0);
+    const char *m = pp && M32(pp) ? GSTR(M32(pp)) : NULL;
+    M32(t) = exc_vtable();
+    M32(t + 4) = gstrdup(m ? m : "Unknown exception");
+    M8(t + 8) = 0;
+    RET(t, 1);
+}
+SHIM(exc_ctor_copy) {
+    uint32_t t = c->r[1], s = ARG(0);
+    M32(t) = exc_vtable();
+    M32(t + 4) = gstrdup(s && M32(s + 4) ? GSTR(M32(s + 4)) : "Unknown exception");
+    M8(t + 8) = 0;
+    RET(t, 1);
+}
+SHIM(exc_dtor) { RET(c->r[1], 0); }
+SHIM(exc_what) { RET(M32(c->r[1] + 4), 0); }
+
+/* ?uncaught_exception@std@@YA_NXZ */
+SHIM(std_uncaught_exception) { RETC(0); }
+/* char_traits<unsigned short>: compare(s1, s2, n) / find(s, n, c). */
+static int cmp16(uint32_t a, uint32_t b, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        uint16_t x = M16(a + 2 * i), y = M16(b + 2 * i);
+        if (x != y) return x < y ? -1 : 1;
+    }
+    return 0;
+}
+SHIM(tr_compare_w) { RETC(cmp16(ARG(0), ARG(1), ARG(2))); }
+SHIM(tr_find_w) {
+    uint32_t s = ARG(0), n = ARG(1), cp = ARG(2);
+    uint16_t ch = cp ? M16(cp) : 0;
+    for (uint32_t i = 0; i < n; i++) if (M16(s + 2 * i) == ch) RETC(s + 2 * i);
+    RETC(0);
+}
+
+/* ---- KERNEL32 -------------------------------------------------------- */
+SHIM(lstrlenA) { const char *s = GSTR(ARG(0)); RET(s ? (uint32_t)strlen(s) : 0, 1); }
+SHIM(lstrlenW) {
+    uint32_t s = ARG(0), n = 0;
+    while (s && M16(s + 2 * n)) n++;
+    RET(n, 1);
+}
+/* GetCurrentDirectoryA(n, buf): the process CWD is the game folder. The
+ * returned length excludes the NUL; if the buffer is too small, the length
+ * needed including the NUL. */
+SHIM(GetCurrentDirectoryA) {
+    uint32_t cap = ARG(0), buf = ARG(1);
+    char cwd[1024];
+    if (!getcwd(cwd, sizeof cwd)) RET(0, 2);
+    for (char *q = cwd; *q; q++) if (*q == '/') *q = '\\';
+    uint32_t n = (uint32_t)strlen(cwd);
+    if (cap > n) { memcpy(MEM + buf, cwd, n + 1); RET(n, 2); }
+    RET(n + 1, 2);
+}
+SHIM(CreateDirectoryW) {
+    uint32_t s = narrow_dup(ARG(0));
+    char host[1024];
+    rt_host_path(GSTR(s), host, sizeof host);
+    for (char *q = host + 1; *q; q++)
+        if (*q == '/') { *q = 0; mkdir(host, 0755); *q = '/'; }
+    int ok = mkdir(host, 0755) == 0;
+    if (!ok && errno == EEXIST) rt_set_last_error(c, 183);
+    gfree(s);
+    RET(ok, 2);
+}
+SHIM(GetFileAttributesW) {
+    uint32_t s = narrow_dup(ARG(0));
+    char host[1024];
+    struct stat st;
+    uint32_t r = 0xFFFFFFFFu;
+    if (rt_host_path(GSTR(s), host, sizeof host) && stat(host, &st) == 0)
+        r = S_ISDIR(st.st_mode) ? 0x10 : 0x80;
+    else
+        rt_set_last_error(c, 2);
+    gfree(s);
+    RET(r, 1);
+}
+/* The sandbox has no attribute bits; the game only clears the read-only
+ * flag around its own saves, which the open modes already handle. */
+SHIM(SetFileAttributesW) { once("kernel32.SetFileAttributesW (no attribute bits)"); RET(1, 2); }
+SHIM(GetLocalTime) {
+    time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    uint32_t o = ARG(0);
+    M16(o) = (uint16_t)(tm.tm_year + 1900);
+    M16(o + 2) = (uint16_t)(tm.tm_mon + 1);
+    M16(o + 4) = (uint16_t)tm.tm_wday;
+    M16(o + 6) = (uint16_t)tm.tm_mday;
+    M16(o + 8) = (uint16_t)tm.tm_hour;
+    M16(o + 10) = (uint16_t)tm.tm_min;
+    M16(o + 12) = (uint16_t)tm.tm_sec;
+    M16(o + 14) = 0;
+    RET(0, 1);
+}
+/* VirtualQuery(addr, mbi, len): a faithful-enough picture of the guest map.
+ * The three images and the heap read as committed, everything else as free,
+ * so the game's address-space walk steps over regions instead of probing
+ * every page. */
+SHIM(VirtualQuery) {
+    uint32_t a = ARG(0), out = ARG(1), len = ARG(2);
+    if (len < 28) RET(0, 3);
+    memset(MEM + out, 0, 28);
+    M32(out) = a;
+    uint32_t base = 0, end = 0, protect = 0x01 /* PAGE_NOACCESS */, state = 0x10000 /* MEM_FREE */, type = 0;
+    if (a >= 0x00400000u && a < 0x00409000u) { base = 0x00400000u; end = 0x00409000u; protect = 0x20; state = 0x1000; type = 0x1000000; }
+    else if (a >= 0x09000000u && a < 0x09038000u) { base = 0x09000000u; end = 0x09038000u; protect = 0x20; state = 0x1000; type = 0x1000000; }
+    else if (a >= 0x10000000u && a < 0x1192a000u) { base = 0x10000000u; end = 0x1192a000u; protect = 0x20; state = 0x1000; type = 0x1000000; }
+    else if (a >= GUEST_STACK_BASE && a < GUEST_MISC_BASE + 0x10000u) { base = GUEST_STACK_BASE; end = GUEST_MISC_BASE + 0x10000u; protect = 0x04; state = 0x1000; type = 0x20000; }
+    else if (a >= GUEST_HEAP_BASE && a < GUEST_HEAP_END) { base = GUEST_HEAP_BASE; end = GUEST_HEAP_END; protect = 0x04; state = 0x1000; type = 0x20000; }
+    else if (a >= GUEST_VA_BASE && a < GUEST_VA_END) { base = GUEST_VA_BASE; end = GUEST_VA_END; protect = 0x04; state = 0x1000; type = 0x20000; }
+    else { base = a; end = a + 0x1000; }
+    M32(out + 4) = base;                    /* AllocationBase */
+    M32(out + 8) = protect;                 /* AllocationProtect */
+    M32(out + 12) = end - a;                /* RegionSize */
+    M32(out + 16) = state;
+    M32(out + 20) = protect;
+    M32(out + 24) = type;
+    RET(28, 3);
+}
+/* GetDiskFreeSpaceExA: 64 GiB free, enough for any save-size check. */
+SHIM(GetDiskFreeSpaceExA) {
+    for (int i = 1; i <= 3; i++) {
+        uint32_t p = ARG(i);
+        if (!p) continue;
+        M32(p) = 0;
+        M32(p + 4) = 0x10;
+    }
+    RET(1, 4);
+}
+SHIM(GetLogicalDriveStringsA) {
+    uint32_t cap = ARG(0), buf = ARG(1);
+    if (cap < 5) RET(0, 2);
+    memcpy(MEM + buf, "C:\\\0\0", 5);
+    RET(4, 2);
+}
+SHIM(GetThreadLocale) { RET(0x0409, 0); }  /* en-US */
+SHIM(OpenMutexA) {
+    static int seen;
+    if (!seen++) LOG("fc2: kernel32.OpenMutexA -> not found (no single-instance check)");
+    rt_set_last_error(c, 2);
+    RET(0, 3);
+}
+SHIM(PulseEvent) { RET(1, 1); }
+SHIM(SuspendThread) { once("kernel32.SuspendThread (threads are never suspended)"); RET(0xFFFFFFFFu, 1); }
+/* DuplicateHandle: only the pseudo current-process/thread handles are
+ * duplicated; real handles would need the handle table's type. */
+SHIM(DuplicateHandle) {
+    uint32_t src = ARG(1), out = ARG(3);
+    if (src == 0xFFFFFFFFu || src == 0xFFFFFFFEu) {
+        if (out) M32(out) = h_new(H_OTHER, NULL);
+        RET(1, 7);
+    }
+    once("kernel32.DuplicateHandle (only the pseudo handles)");
+    if (out) M32(out) = 0;
+    RET(0, 7);
+}
+
+/* ---- private profiles: a small real INI reader/writer ---------------- */
+static int ini_get(const char *host, const char *app, const char *key, char *out, size_t cap) {
+    FILE *f = fopen(host, "r");
+    if (!f) return 0;
+    char line[1024];
+    int in_section = 0, found = 0;
+    while (!found && fgets(line, sizeof line, f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        size_t len = strlen(p);
+        while (len && (p[len - 1] == '\n' || p[len - 1] == '\r' || p[len - 1] == ' ' || p[len - 1] == '\t'))
+            p[--len] = 0;
+        if (*p == '[') {
+            char *e = strchr(p, ']');
+            if (e) *e = 0;
+            in_section = !strcasecmp(p + 1, app);
+            continue;
+        }
+        if (!in_section || !*p || *p == ';' || *p == '#') continue;
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = 0;
+        size_t kl = strlen(p);
+        while (kl && (p[kl - 1] == ' ' || p[kl - 1] == '\t')) p[--kl] = 0;
+        if (strcasecmp(p, key)) continue;
+        char *v = eq + 1;
+        while (*v == ' ' || *v == '\t') v++;
+        snprintf(out, cap, "%s", v);
+        found = 1;
+    }
+    fclose(f);
+    return found;
+}
+/* Append to a bounded buffer, keeping `on` inside `cap` even if truncated. */
+static void emit(char *out, size_t cap, size_t *on, const char *fmt, ...) {
+    if (*on + 1 >= cap) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int w = vsnprintf(out + *on, cap - *on, fmt, ap);
+    va_end(ap);
+    if (w <= 0) return;
+    *on += ((size_t)w < cap - *on) ? (size_t)w : cap - *on - 1;
+}
+
+/* Rewrites the whole file: replaces the key inside its section, inserts it
+ * at the end of the section, or appends a new section. */
+static int ini_write(const char *host, const char *app, const char *key, const char *val) {
+    char *data = NULL;
+    size_t n = 0;
+    FILE *f = fopen(host, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (sz > 0) {
+            data = malloc((size_t)sz + 1);
+            if (data) { n = fread(data, 1, (size_t)sz, f); data[n] = 0; }
+        }
+        fclose(f);
+    }
+    if (!data) { data = malloc(1); if (!data) return 0; data[0] = 0; }
+
+    size_t cap = n + strlen(app) + strlen(key) + strlen(val) + 64;
+    char *out = malloc(cap);
+    if (!out) { free(data); return 0; }
+    size_t on = 0;
+    int in_section = 0, replaced = 0;
+#define PUT(...) emit(out, cap, &on, __VA_ARGS__)
+    char *q = data;
+    while (*q) {
+        char *nl = strchr(q, '\n');
+        size_t len = nl ? (size_t)(nl - q) + 1 : strlen(q);
+        /* does this line open the target section? */
+        char *t = q;
+        while (*t == ' ' || *t == '\t') t++;
+        int is_header = (*t == '[');
+        char header_app[256] = "";
+        if (is_header) {
+            char *e = strchr(t, ']');
+            size_t hl = e ? (size_t)(e - t - 1) : 0;
+            if (hl >= sizeof header_app) hl = sizeof header_app - 1;
+            memcpy(header_app, t + 1, hl);
+            header_app[hl] = 0;
+        }
+        if (is_header && in_section && !replaced) {
+            /* leaving the section without the key: add it before the header */
+            PUT("%s=%s\n", key, val);
+            replaced = 1;
+        }
+        if (is_header) {
+            in_section = !strcasecmp(header_app, app);
+        } else if (in_section && !replaced) {
+            char *eq = strchr(t, '=');
+            if (eq) {
+                size_t kl = (size_t)(eq - t);
+                while (kl && (t[kl - 1] == ' ' || t[kl - 1] == '\t')) kl--;
+                if (kl == strlen(key) && !strncasecmp(t, key, kl)) {
+                    PUT("%s=%s\n", key, val);
+                    replaced = 1;
+                    q += len;
+                    continue;
+                }
+            }
+        }
+        memcpy(out + on, q, len);
+        on += len;
+        q += len;
+    }
+    if (in_section && !replaced) { PUT("%s=%s\n", key, val); replaced = 1; }
+    if (!replaced) {
+        if (on && out[on - 1] != '\n') out[on++] = '\n';
+        PUT("[%s]\n%s=%s\n", app, key, val);
+    }
+#undef PUT
+    int ok = 0;
+    f = fopen(host, "wb");
+    if (f) { ok = fwrite(out, 1, on, f) == on; fclose(f); }
+    free(out);
+    free(data);
+    return ok;
+}
+SHIM(GetPrivateProfileStringA) {
+    uint32_t cap = ARG(4), buf = ARG(3);
+    const char *file = GSTR(ARG(5));
+    char host[1024];
+    rt_host_path(file && *file ? file : "port/settings.ini", host, sizeof host);
+    char val[512];
+    const char *r = NULL;
+    if (ini_get(host, GSTR(ARG(0)), GSTR(ARG(1)), val, sizeof val)) r = val;
+    else r = GSTR(ARG(2)) ? GSTR(ARG(2)) : "";
+    size_t n = strlen(r);
+    if (cap) {
+        size_t c = n < cap - 1 ? n : cap - 1;
+        memcpy(MEM + buf, r, c);
+        ((char *)MEM)[buf + c] = 0;
+    }
+    RET((uint32_t)n, 6);
+}
+SHIM(WritePrivateProfileStringA) {
+    const char *file = GSTR(ARG(3));
+    if (!file || !*file) RET(0, 4);
+    char host[1024];
+    rt_host_path(file, host, sizeof host);
+    const char *v = GSTR(ARG(2));
+    RET(ini_write(host, GSTR(ARG(0)), GSTR(ARG(1)), v ? v : ""), 4);
+}
+
+/* ---- USER32 ---------------------------------------------------------- */
+/* wsprintfA(buf, fmt, ...) is cdecl and takes its args from the stack. */
+SHIM(wsprintfA) {
+    char tmp[1024];
+    size_t n = guest_vformat(tmp, sizeof tmp, GSTR(ARG(1)), c->r[4] + 12);
+    uint32_t buf = ARG(0);
+    if (buf) memcpy(MEM + buf, tmp, n + 1);
+    RETC((uint32_t)n);
+}
+SHIM(GetKeyState) {
+    extern const uint8_t *user32_vk_states(void);
+    uint32_t vk = ARG(0) & 0xFF;
+    const uint8_t *s = user32_vk_states();
+    RET((s[vk] & 0x80) ? 0x8000u : 0, 1);
+}
+SHIM(PostMessageA) {
+    static int seen;
+    if (!seen++) LOG("fc2: user32.PostMessageA dropped (msg %u)", ARG(1));
+    RET(1, 4);
+}
+SHIM(SetWindowTextA) { RET(1, 2); }
+SHIM(UpdateLayeredWindow) { once("user32.UpdateLayeredWindow (no layered windows)"); RET(0, 8); }
+SHIM(EnumDisplayDevicesA) { RET(0, 4); }
+SHIM(ToAsciiEx) { RET(0, 6); }
+SHIM(IsCharAlphaNumericW) {
+    uint16_t ch = (uint16_t)ARG(0);
+    RET(ch < 128 && isalnum((int)ch), 1);
+}
+SHIM(OpenClipboard) { RET(1, 1); }
+SHIM(CloseClipboard) { RET(1, 0); }
+SHIM(EmptyClipboard) { RET(1, 0); }
+SHIM(GetClipboardData) { RET(0, 1); }
+SHIM(SetClipboardData) { RET(0, 2); }
+SHIM(IsClipboardFormatAvailable) { RET(0, 1); }
+
+/* ---- GDI32: the two object calls the shared table lacks -------------- */
+SHIM(CreateSolidBrush) { RET(0x3000Au, 1); }
+SHIM(GetStockObject) { RET(0x3000Bu, 1); }
+
+/* ---- SHELL32: the Documents folder the game stores its profile in ----
+ * The Windows path below maps (kernel32.c's rt_host_path) onto g_save_dir,
+ * which the launcher points inside the game folder. */
+SHIM(SHGetFolderPathW) {
+    static const char k_docs[] = "C:\\users\\player\\Documents";
+    uint32_t buf = ARG(4);
+    if (!buf) RET(0x80070057u, 5);           /* E_INVALIDARG */
+    for (size_t i = 0; i <= sizeof k_docs - 1; i++) M16(buf + 2 * i) = (uint8_t)k_docs[i];
+    RET(0, 5);                                /* S_OK */
+}
+
+/* ---- ADVAPI32: no registry; the game falls back to its ini files ----- */
+SHIM(RegCreateKeyExA) {
+    static int seen;
+    if (!seen++) LOG("fc2: advapi32.RegCreateKeyExA([%s]) -> no registry", GSTR(ARG(1)) ? GSTR(ARG(1)) : "");
+    if (ARG(7)) M32(ARG(7)) = 0;
+    if (ARG(8)) M32(ARG(8)) = 0;
+    RET(1, 9);                                /* ERROR_INVALID_FUNCTION */
+}
+
+/* ==================================================================== */
 /* registration                                                         */
 /* ==================================================================== */
 static const ShimDef defs[] = {
@@ -684,6 +1120,41 @@ static const ShimDef defs[] = {
     {NULL, NULL, NULL}
 };
 
+/* Imports the first boot of the game was observed to need (docs/RECON.md,
+ * "Known gaps"): registered separately so the original table above stays a
+ * readable record of what the shared runtime already covered. */
+static const ShimDef extra[] = {
+#define M(n) {"msvcr80.dll", #n, shim_##n},
+    M(_configthreadlocale) M(_invoke_watson) M(memchr) M(_itoa_s)
+#undef M
+#define U(n) {"user32.dll", #n, shim_##n},
+    U(wsprintfA) U(GetKeyState) U(PostMessageA) U(SetWindowTextA) U(UpdateLayeredWindow)
+    U(EnumDisplayDevicesA) U(ToAsciiEx) U(IsCharAlphaNumericW)
+    U(OpenClipboard) U(CloseClipboard) U(EmptyClipboard) U(GetClipboardData)
+    U(SetClipboardData) U(IsClipboardFormatAvailable)
+#undef U
+#define K(n) {"kernel32.dll", #n, shim_##n},
+    K(lstrlenA) K(lstrlenW) K(GetCurrentDirectoryA) K(CreateDirectoryW) K(GetFileAttributesW)
+    K(SetFileAttributesW) K(GetLocalTime) K(VirtualQuery) K(GetDiskFreeSpaceExA)
+    K(GetLogicalDriveStringsA) K(GetThreadLocale) K(OpenMutexA) K(PulseEvent)
+    K(SuspendThread) K(DuplicateHandle) K(GetPrivateProfileStringA) K(WritePrivateProfileStringA)
+#undef K
+#define G(n) {"gdi32.dll", #n, shim_##n},
+    G(CreateSolidBrush) G(GetStockObject)
+#undef G
+    {"shell32.dll", "SHGetFolderPathW", shim_SHGetFolderPathW},
+    {"advapi32.dll", "RegCreateKeyExA", shim_RegCreateKeyExA},
+    { "msvcr80.dll", "??0exception@std@@QAE@XZ", shim_exc_ctor },
+    { "msvcr80.dll", "??0exception@std@@QAE@ABQBD@Z", shim_exc_ctor_msg },
+    { "msvcr80.dll", "??0exception@std@@QAE@ABV01@@Z", shim_exc_ctor_copy },
+    { "msvcr80.dll", "??1exception@std@@UAE@XZ", shim_exc_dtor },
+    { "msvcr80.dll", "?what@exception@std@@UBEPBDXZ", shim_exc_what },
+    { "msvcp80.dll", "?uncaught_exception@std@@YA_NXZ", shim_std_uncaught_exception },
+    { "msvcp80.dll", "?compare@?$char_traits@G@std@@SAHPBG0I@Z", shim_tr_compare_w },
+    { "msvcp80.dll", "?find@?$char_traits@G@std@@SAPBGPBGIABG@Z", shim_tr_find_w },
+    {NULL, NULL, NULL}
+};
+
 /* MSVCP80 iostream/stringstream: registered with NULL implementations so
  * the import resolves and the first call stops with its mangled name
  * (rt_call: "unimplemented import ..."). */
@@ -714,7 +1185,7 @@ static const ShimDef msvcp_traps[] = {
     ST80("?fill@?$basic_ios@GU?$char_traits@G@std@@@std@@QBEGXZ")
     ST80("??_D?$basic_ostringstream@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QAEXXZ")
     ST80("?str@?$basic_ostringstream@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QBE?AV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@2@XZ")
-    ST80("?str@?$basic_ostringstream@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QAEXABV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@2@Z")
+    ST80("?str@?$basic_ostringstream@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QAEXABV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@2@@Z")
     ST80("??0?$basic_ostringstream@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@QAE@H@Z")
     ST80("??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEAAV01@K@Z")
     ST80("??6?$basic_ostream@DU?$char_traits@D@std@@@std@@QAEAAV01@G@Z")
@@ -730,6 +1201,7 @@ static const ShimDef msvcp_traps[] = {
 
 void fc2_shims_init(void) {
     rt_register_shims(defs);
+    rt_register_shims(extra);
     msvcrt_register_as_msvcr80();
 
     rt_register_shims(msvcp_traps);

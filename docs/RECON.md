@@ -234,10 +234,25 @@ and a log line instead of silently returning garbage.
 | `DSOUND` #11/#2, `EAX` #6 | `runtime/dsound.c` (SDL2 audio), EAX ignored |
 | `binkw32` (16) | **recompiled** `gen/bink_*.c` |
 | `MSVCR80` (180) | `runtime/msvcrt.c` + `runtime/crt_shims.c` (aliased `msvcr80`) + `runtime/fc2_shims.c` |
-| `MSVCP80` (71) | `basic_string`/`char_traits` implemented; iostreams are loud traps |
+| `MSVCP80` (71) | `basic_string`/`char_traits`/`std::exception` implemented; iostreams are loud traps |
 | Win32 (KERNEL32/USER32/GDI32/…) | `runtime/kernel32.c`, `user32.c`, `misc.c`, `fc2_shims.c` |
 | Winsock/WinHTTP/WinINet/Secur32/Crypt32 | offline stubs in `runtime/fc2_shims.c` |
 | `dbghelp`, `psapi`, `iphlpapi`, `rpcrt4` | stubs in `runtime/fc2_shims.c` |
+
+`tools/import_coverage.py <game dir>` reads the PE import tables and the runtime
+shim tables and reports where each import lands:
+
+```
+farcry2.exe      44 imports |   44 implemented |   0 loud traps |   0 abort stubs
+Dunia.dll       602 imports |  567 implemented |  35 loud traps |   0 abort stubs
+binkw32.dll      91 imports |   91 implemented |   0 loud traps |   0 abort stubs
+```
+
+Every import of all three modules resolves to either an implementation or a
+deliberate loud trap. The 35 traps are the MSVCP80 iostream/stringstream entry
+points, kept as `NULL` on purpose so the first call stops at one identifiable
+mangled name.
+
 
 `crt_shims.c` registers its table under both `msvcr71.dll` (the reference ports)
 and `msvcr80.dll` (this game), and registers the data imports `_acmdln`,
@@ -294,11 +309,12 @@ no entry, so a call aborts by address rather than jumping into nothing.
 | Gap | Evidence / effect |
 |---|---|
 | **SEH / C++ exceptions** | `Dunia.dll` imports `_except_handler3`, `_except_handler4_common`, `__CxxFrameHandler3`, `_CxxThrowException`, `_setjmp3`/`longjmp`. `fc2_shims.c` traps the handlers with `rt_fatal`; the first real exception stops the game. **Top blocker.** |
-| **MSVCP80 iostreams** | 40+ iostream/stringstream entry points are registered as `NULL`; the first call aborts with its mangled name. Only `basic_string`/`char_traits` work. |
+| **MSVCP80 iostreams** | 35 iostream/stringstream entry points are registered as `NULL`; the first call aborts with its mangled name. `basic_string`, `char_traits` and `std::exception` do work. |
 | **No network** | Winsock/WinHTTP/WinINet/Secur32/Crypt32 are offline stubs. |
 | **DXT mips** | `D3DXFilterTexture` builds levels without filtering (logged). |
 | **In-memory texture save** | `D3DXSaveTextureToFileInMemory` → `E_NOTIMPL`. |
 | **Indirect-jump coverage** | 1,512 unresolved targets in Dunia; a call into one aborts at its address. |
+| **All other imports** | resolved: `tools/import_coverage.py` reports 0 unregistered imports across the three modules (see §9). |
 | **Unverified code** | Nothing has run on a device yet; see `docs/TESTED.md`. |
 
 ## 12. Commands used

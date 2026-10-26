@@ -998,6 +998,75 @@ SHIM(FindClose) {
     RET(1, 1);
 }
 
+/* The same listing, writing the name as UTF-16 (WIN32_FIND_DATAW's
+ * cFileName at +44). Far Cry 2's file manager enumerates with the W calls. */
+static int find_next_w(GFind *g, uint32_t out) {
+    struct dirent *de;
+    while ((de = readdir(g->d))) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        if (fnmatch(g->pat, de->d_name, FNM_CASEFOLD)) continue;
+        char full[1400];
+        struct stat st;
+        snprintf(full, sizeof full, "%s/%s", g->dir, de->d_name);
+        if (stat(full, &st)) continue;
+        memset(MEM + out, 0, 592);
+        M32(out) = attrs_of(&st);
+        unix_to_filetime(st.st_mtime, out + 4);
+        unix_to_filetime(st.st_mtime, out + 12);
+        unix_to_filetime(st.st_mtime, out + 20);
+        M32(out + 28) = (uint32_t)((uint64_t)st.st_size >> 32);
+        M32(out + 32) = (uint32_t)st.st_size;
+        for (int i = 0; de->d_name[i] && i < 259; i++)
+            M16(out + 44 + 2 * i) = (uint8_t)de->d_name[i];
+        return 1;
+    }
+    return 0;
+}
+
+SHIM(FindFirstFileW) {
+    char host[1024];
+    char pat[520];
+    uint32_t w = ARG(0);
+    int i = 0;
+    for (; w && i < 519 && M16(w + 2 * i); i++) pat[i] = (char)M16(w + 2 * i);
+    pat[i] = 0;
+    rt_host_path(pat, host, sizeof host);
+    GFind *g = calloc(1, sizeof *g);
+    char *slash = strrchr(host, '/');
+    if (slash) { *slash = 0; snprintf(g->dir, sizeof g->dir, "%s", host); snprintf(g->pat, sizeof g->pat, "%s", slash + 1); }
+    else { strcpy(g->dir, "."); snprintf(g->pat, sizeof g->pat, "%s", host); }
+    if (!strcmp(g->pat, "*.*")) strcpy(g->pat, "*");
+    char dir[1024];
+    snprintf(dir, sizeof dir, "%s", g->dir);
+    resolve_ci(dir);
+    snprintf(g->dir, sizeof g->dir, "%s", dir);
+    g->d = opendir(g->dir);
+    LOG("FindFirstFileW %s -> %s/%s%s", pat, g->dir, g->pat, g->d ? "" : " (no such folder)");
+    if (!g->d || !find_next_w(g, ARG(1))) {
+        if (g->d) closedir(g->d);
+        free(g);
+        rt_set_last_error(c, ERROR_FILE_NOT_FOUND);
+        RET(INVALID_HANDLE, 2);
+    }
+    RET(h_new(H_FIND, g), 2);
+}
+SHIM(FindNextFileW) {
+    GFind *g = h_get(ARG(0), H_FIND);
+    if (!g || !find_next_w(g, ARG(1))) { rt_set_last_error(c, ERROR_NO_MORE_FILES); RET(0, 2); }
+    RET(1, 2);
+}
+
+/* GetFileTime(handle, creation, access, write): from the open fd. */
+SHIM(GetFileTime) {
+    GFile *f = h_get(ARG(0), H_FILE);
+    struct stat st;
+    if (!f || fstat(f->fd, &st)) RET(0, 4);
+    if (ARG(1)) unix_to_filetime(st.st_ctime, ARG(1));
+    if (ARG(2)) unix_to_filetime(st.st_atime, ARG(2));
+    if (ARG(3)) unix_to_filetime(st.st_mtime, ARG(3));
+    RET(1, 4);
+}
+
 /* ===================== heap / virtual memory ===================== */
 #define HEAP_HANDLE 0x00150000u
 SHIM(GetProcessHeap) { RET(HEAP_HANDLE, 0); }
@@ -1188,6 +1257,24 @@ SHIM(GetEnvironmentStringsW) { RET(g_envw, 0); }
 SHIM(FreeEnvironmentStringsA) { RET(1, 1); }
 SHIM(FreeEnvironmentStringsW) { RET(1, 1); }
 SHIM(SetEnvironmentVariableA) { RET(1, 2); }
+/* GetEnvironmentVariableA(name, buf, n): the guest env block is "A=B\0...".
+ * Windows returns the value's length including the NUL, 0 when not present. */
+SHIM(GetEnvironmentVariableA) {
+#define ERROR_ENVVAR_NOT_FOUND 203
+    const char *name = GSTR(ARG(0));
+    uint32_t buf = ARG(1), cap = ARG(2);
+    if (!name || !*name) RET(0, 3);
+    size_t nl = strlen(name);
+    for (const char *p = (const char *)MEM + g_env; *p; p += strlen(p) + 1) {
+        if (strncasecmp(p, name, nl) || p[nl] != '=') continue;
+        const char *v = p + nl + 1;
+        size_t vl = strlen(v);
+        if (cap > vl) memcpy(MEM + buf, v, vl + 1);
+        RET((uint32_t)vl + 1, 3);
+    }
+    rt_set_last_error(c, ERROR_ENVVAR_NOT_FOUND);
+    RET(0, 3);
+}
 SHIM(ExpandEnvironmentStringsA) {
     const char *s = GSTR(ARG(0));
     uint32_t n = (uint32_t)strlen(s) + 1;
@@ -1274,6 +1361,26 @@ SHIM(GetModuleHandleA) {
     if (module_absent(n)) RET(0, 1);
     if (module_base(n)) RET(module_base(n), 1);
     RET(pseudo_module(n), 1);
+}
+/* Which loaded module contains an address (GM_FROM_ADDRESS). The three images
+ * sit at fixed bases; Dunia's image is 0x192a000 bytes, so cover that. */
+static uint32_t module_base_of(uint32_t a) {
+    if (a >= 0x00400000u && a < 0x00500000u) return 0x00400000u;
+    if (a >= 0x09000000u && a < 0x09080000u) return 0x09000000u;
+    if (a >= 0x10000000u && a < 0x11930000u) return 0x10000000u;
+    return 0;
+}
+/* GetModuleHandleExA(flags, name, out): name wins, else the address. */
+SHIM(GetModuleHandleExA) {
+    const char *n = GSTR(ARG(1));
+    uint32_t h = 0;
+    if (n && *n) {
+        if (!module_absent(n)) h = module_base(n) ? module_base(n) : pseudo_module(n);
+    } else {
+        h = module_base_of(ARG(0));
+    }
+    if (ARG(2)) M32(ARG(2)) = h;
+    RET(h ? 1 : 0, 3);
 }
 /* One pseudo-module handle per name: FreeLibrary is a no-op, and D3DX
  * loads d3d9.dll on every call. */
@@ -1949,6 +2056,7 @@ static const ShimDef k32[] = {
     S(GetFileType) S(FlushFileBuffers) S(SetEndOfFile) S(CloseHandle) S(GetFileAttributesA)
     S(GetFileAttributesExA) S(DeleteFileA) S(MoveFileA) S(CreateDirectoryA) S(FindFirstFileA)
     S(FindNextFileA) S(FindClose)
+    S(FindFirstFileW) S(FindNextFileW) S(GetFileTime) S(GetEnvironmentVariableA) S(GetModuleHandleExA)
     S(GetProcessHeap) S(HeapCreate) S(HeapDestroy) S(HeapAlloc) S(HeapFree) S(HeapSize) S(HeapReAlloc)
     S(VirtualAlloc) S(VirtualFree)
     S(InterlockedIncrement) S(InterlockedDecrement) S(InterlockedExchange)
