@@ -20,6 +20,7 @@
 #define ERROR_ACCESS_DENIED 5
 #define ERROR_INVALID_HANDLE 6
 #define ERROR_NO_MORE_FILES 18
+#define ERROR_READ_FAULT 30
 #define ERROR_ALREADY_EXISTS 183
 #define INVALID_HANDLE 0xFFFFFFFFu
 #define WAIT_TIMEOUT 0x102u
@@ -773,6 +774,14 @@ SHIM(CreateFileA) {
             snprintf(g_last_cache_miss, sizeof g_last_cache_miss, "%s", strrchr(host, '/') + 1);
             if (++s_cache_misses % 500 == 1)
                 LOG("shader cache: %u not cached yet (e.g. %s)", s_cache_misses, strrchr(host, '/') + 1);
+        } else if (strstr(host, "/data_win32/") || strstr(host, "\\data_win32\\")) {
+            /* A data file the engine failed to open is exactly what a stalled
+             * world load needs the log to show (the pack reader gives up
+             * silently when its open fails), so these are LOG, not TRACE.
+             * Rate-limited: some engines probe hundreds of optionals. */
+            static uint32_t s_data_fails;
+            if (++s_data_fails <= 32 || s_data_fails % 100 == 0)
+                LOG("CreateFileA failed: %s (%s): errno %d %s", name, host, errno, strerror(errno));
         } else
             TRACE("CreateFileA failed: %s (%s): errno %d %s", name, host, errno, strerror(errno));
         rt_set_last_error(c, errno == ENOENT ? ERROR_FILE_NOT_FOUND : ERROR_ACCESS_DENIED);
@@ -793,10 +802,38 @@ SHIM(ReadFile) {
     GFile *f = h_get(ARG(0), H_FILE);
     uint32_t buf = ARG(1), n = ARG(2), ov = ARG(4);
     if (!f) { if (ARG(3)) M32(ARG(3)) = 0; rt_set_last_error(c, ERROR_INVALID_HANDLE); RET(0, 5); }
-    ssize_t r;
-    if (ov) r = pread(f->fd, MEM + buf, n, (off_t)M32(ov + 8) | ((off_t)M32(ov + 12) << 32));
-    else r = read(f->fd, MEM + buf, n);
-    if (r < 0) r = 0;
+    /* Windows disk reads return every byte asked for short of EOF, but one
+     * read(2) over Android's FUSE storage (/storage/emulated/0) silently caps
+     * at the connection's max_read (128 KiB there): a 1 MiB request comes
+     * back as 128 KiB and success. The engine's pack/world loaders issue
+     * multi-megabyte reads and trust the count, so short reads corrupted
+     * everything past the first chunk -- the intro (small reads) worked and
+     * the story world load did not. Loop until the buffer is full, EOF or an
+     * error, like a Windows disk read. */
+    size_t done = 0;
+    off_t at = -1;
+    if (ov) at = (off_t)M32(ov + 8) | ((off_t)M32(ov + 12) << 32);
+    while (done < n) {
+        ssize_t r = at >= 0 ? pread(f->fd, MEM + buf + done, n - done, at + (off_t)done)
+                            : read(f->fd, MEM + buf + done, n - done);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            if (!done) {
+                static uint32_t s_read_fails;
+                if (++s_read_fails % 50 == 1)
+                    LOG("ReadFile %s failed at %zu/%u: errno %d (%s)", f->path, done, n,
+                        errno, strerror(errno));
+                rt_set_last_error(c, ERROR_READ_FAULT);
+                if (ARG(3)) M32(ARG(3)) = 0;
+                if (ov) { M32(ov) = -1; M32(ov + 4) = errno; }
+                RET(0, 5);
+            }
+            break;  /* partial data then a stall: return what was read */
+        }
+        if (r == 0) break;  /* EOF */
+        done += (size_t)r;
+    }
+    size_t r = done;
     if (ARG(3)) M32(ARG(3)) = (uint32_t)r;
     if (ov) {
         M32(ov) = 0;
@@ -1079,6 +1116,10 @@ SHIM(FindFirstFileW) {
     g->d = opendir(g->dir);
     LOG("FindFirstFileW %s -> %s/%s%s", pat, g->dir, g->pat, g->d ? "" : " (no such folder)");
     if (!g->d || !find_next_w(g, ARG(1))) {
+        /* The pattern here is often a single file (worlds.dat, dominos.dat),
+           and the engine's world list depends on those existing, so say
+           whether the match itself failed, not just the folder. */
+        LOG("FindFirstFileW %s: no match in %s", pat, g->d ? g->dir : "(folder missing)");
         if (g->d) closedir(g->d);
         free(g);
         rt_set_last_error(c, ERROR_FILE_NOT_FOUND);
