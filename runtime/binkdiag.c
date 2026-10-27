@@ -159,6 +159,10 @@ static void shim_bk_BinkDoFrame(CPU *c) {
     RET(r, 1);
 }
 
+/* The texture bridge asks this to tell whether the buffer it is about to
+ * unlock is one of the planes Bink was handed for the current frame. */
+uint32_t binkdiag_fb(void) { return g_bk_fb; }
+
 static const struct { const char *name; ShimFn fn; } k_wrapped[] = {
     { "_BinkSetSoundSystem@8",       shim_bk_BinkSetSoundSystem },
     { "_BinkShouldSkip@4",           shim_bk_BinkShouldSkip },

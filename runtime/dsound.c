@@ -86,6 +86,24 @@ static void mix_cb(void *ud, Uint8 *stream, int len) {
         if (out[i] > 1.0f) out[i] = 1.0f;
         else if (out[i] < -1.0f) out[i] = -1.0f;
     }
+    /* Silence can come from either side: the game never creating/playing a
+     * buffer, or the mixer reading a format it does not understand. A
+     * periodic census separates them: if "playing" stays 0 the audio never
+     * reaches DirectSound at all. Every ~200 callbacks is ~4 times a second. */
+    static uint32_t cb_n;
+    if ((++cb_n % 200) == 0) {
+        int live = 0, play = 0, prim = 0;
+        SDL_LockMutex(g_mix_lock);
+        for (int k = 0; k < MAX_BUFFERS; k++) {
+            DSBuf *b = g_bufs[k];
+            if (!b) continue;
+            live++;
+            if (b->primary) prim++;
+            else if (b->playing) play++;
+        }
+        SDL_UnlockMutex(g_mix_lock);
+        LOG("audio: %d buffers (%d primary), %d playing", live, prim, play);
+    }
 }
 
 static void audio_open(void) {

@@ -724,6 +724,9 @@ void B_IDirect3DDevice9_UpdateSurface(CPU *c) {
 // Guest code cannot address host memory, so every lock hands the guest a
 // shadow copy in guest memory and copies it back on unlock.
 namespace {
+// Defined in binkdiag.c (C): the BINKFRAMEBUFFERS the engine handed to Bink.
+extern "C" uint32_t binkdiag_fb(void);
+
 struct Shadow { uint32_t guest; void *host; size_t size; DWORD flags; bool persist; pthread_t th; };
 // A resource can be locked several times at once (nested locks of buffer
 // ranges, or locks from several threads): every lock keeps its own shadow,
@@ -763,7 +766,7 @@ uint32_t shadow_begin(void *obj, uint32_t sub, void *hostbits, size_t size, DWOR
     return g;
 }
 
-bool shadow_end(void *obj, uint32_t sub) {
+bool shadow_end(void *obj, uint32_t sub, uint32_t caller) {
     Shadow s;
     {
         std::lock_guard<std::mutex> l(g_shadow_lock);
@@ -787,6 +790,14 @@ bool shadow_end(void *obj, uint32_t sub) {
         if ((s.size >= 1000000 && s.size <= 1080000) ||
             (s.size >= 250000 && s.size <= 262000)) {
             static int n;
+            uint32_t fb = binkdiag_fb();
+            int match = -1;
+            for (int i = 0; fb && i < 8; i++)
+                if (M32(fb + 0x18 + 12 * i + 4) == s.guest) { match = i; break; }
+            /* Which plane Bink is pointed at for the frame being written, so
+             * the two sides can be compared without guessing. */
+            uint32_t cur = fb ? M32(fb + 0x14) : 0xFFFFFFFFu;
+            uint32_t curplane = fb ? M32(fb + 0x18 + 12 * (4 * cur) + 4) : 0;
             uint32_t nz = 0, sum = 0;
             for (size_t k = 0; k < s.size; k++) {
                 uint8_t v = MEM[s.guest + k];
@@ -794,9 +805,10 @@ bool shadow_end(void *obj, uint32_t sub) {
                 sum += v;
             }
             if (n < 6 || n % 300 == 0)
-                LOG("video plane unlock #%d: %u bytes, nonzero %u sum %u, first %02x %02x %02x %02x",
+                LOG("video plane unlock #%d: %u bytes, nonzero %u sum %u, first %02x %02x %02x %02x, "
+                    "guest %08x, bink frame %u plane %08x, fb entry %d, caller %08x",
                     n, (unsigned)s.size, nz, sum, MEM[s.guest], MEM[s.guest + 1],
-                    MEM[s.guest + 2], MEM[s.guest + 3]);
+                    MEM[s.guest + 2], MEM[s.guest + 3], s.guest, cur, curplane, match, caller);
             n++;
         }
         memcpy(s.host, MEM + s.guest, s.size);
@@ -911,6 +923,21 @@ void lock_rect_common(CPU *c, void *obj, uint32_t sub, const D3DSURFACE_DESC &de
     }
     if (desc.Pool != D3DPOOL_SYSTEMMEM || r) upload = nullptr;
     uint32_t g = shadow_begin(obj, sub, lr.pBits, rect_bytes(desc, r, lr.Pitch), flags, upload);
+    /* The engine hands the locked pointer to Bink by writing it into the
+     * BINKFRAMEBUFFERS entry (entry.plane = pBits), so the buffer logged here
+     * should reappear in the binkdiag dump of the same frame. Log it together
+     * with the guest return address: the two together say whether Bink wrote
+     * into this buffer, and which engine function took the lock. */
+    if (desc.Format == D3DFMT_A8 &&
+        ((desc.Width == 1280 && desc.Height == 800) ||
+         (desc.Width == 640 && desc.Height == 400))) {
+        static int n;
+        if (n < 9 || n % 300 == 0)
+            LOG("video plane lock #%d: %ux%u pool %u flags %x pitch %d pBits %08x caller %08x",
+                n, desc.Width, desc.Height, (unsigned)desc.Pool, (unsigned)flags,
+                (int)lr.Pitch, g, M32(c->r[4]));
+        n++;
+    }
     M32(out) = (uint32_t)lr.Pitch;
     M32(out + 4) = g;
 }
@@ -943,7 +970,7 @@ void B_IDirect3DSurface9_UnlockRect(CPU *c) {
     auto *s = (IDirect3DSurface9 *)com_host(ARG(0));
     void *bt; uint32_t bsub;
     if (bc_surface_target(s, &bt, &bsub)) bc_unlock(bt, bsub);
-    shadow_end(s, 0);
+    shadow_end(s, 0, M32(c->r[4]));
     RET(s->UnlockRect(), 1);
 }
 
@@ -973,7 +1000,7 @@ void B_IDirect3DTexture9_LockRect(CPU *c) {
 void B_IDirect3DTexture9_UnlockRect(CPU *c) {
     auto *t = (IDirect3DTexture9 *)com_host(ARG(0));
     bc_unlock(t, ARG(1));
-    shadow_end(t, ARG(1));
+    shadow_end(t, ARG(1), M32(c->r[4]));
     RET(t->UnlockRect(ARG(1)), 2);
 }
 
@@ -996,7 +1023,7 @@ void B_IDirect3DCubeTexture9_LockRect(CPU *c) {
 void B_IDirect3DCubeTexture9_UnlockRect(CPU *c) {
     auto *t = (IDirect3DCubeTexture9 *)com_host(ARG(0));
     bc_unlock(t, ARG(1) << 16 | ARG(2));
-    shadow_end(t, ARG(1) << 16 | ARG(2));
+    shadow_end(t, ARG(1) << 16 | ARG(2), M32(c->r[4]));
     RET(t->UnlockRect((D3DCUBEMAP_FACES)ARG(1), ARG(2)), 3);
 }
 
@@ -1032,7 +1059,7 @@ void B_IDirect3DVolumeTexture9_LockBox(CPU *c) {
 
 void B_IDirect3DVolumeTexture9_UnlockBox(CPU *c) {
     auto *t = (IDirect3DVolumeTexture9 *)com_host(ARG(0));
-    shadow_end(t, ARG(1));
+    shadow_end(t, ARG(1), M32(c->r[4]));
     RET(t->UnlockBox(ARG(1)), 2);
 }
 
@@ -1049,7 +1076,7 @@ void B_IDirect3DVolume9_LockBox(CPU *c) {
 
 void B_IDirect3DVolume9_UnlockBox(CPU *c) {
     auto *v = (IDirect3DVolume9 *)com_host(ARG(0));
-    shadow_end(v, 0);
+    shadow_end(v, 0, M32(c->r[4]));
     RET(v->UnlockBox(), 1);
 }
 
@@ -1071,7 +1098,7 @@ static void buffer_lock(CPU *c) {
 template <class B>
 static void buffer_unlock(CPU *c) {
     auto *b = (B *)com_host(ARG(0));
-    shadow_end(b, 0);
+    shadow_end(b, 0, M32(c->r[4]));
     RET(b->Unlock(), 1);
 }
 
