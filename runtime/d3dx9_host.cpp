@@ -29,6 +29,12 @@
 
 #include "d3d9_bridge.h"
 
+// BC (DXT) emulation shared with the D3D9 bridge (runtime/d3d9_bcemu.cpp):
+// create DXT textures as A8R8G8B8 on a host whose Vulkan driver lacks
+// textureCompressionBC, and keep reporting the guest DXT format.
+extern "C" uint32_t bc_host_format(IDirect3DDevice9 *d, uint32_t fmt);
+extern "C" void bc_register_texture(void *tex, uint32_t guest_fmt);
+
 extern "C" {
 #include "rt.h"
 }
@@ -553,10 +559,16 @@ extern "C" void shim_D3DXGetImageInfoFromFileInMemory(CPU *c) {
     RET(hr, 3);
 }
 
-static IDirect3DTexture9 *create_tex(IDirect3DDevice9 *dev, UINT w, UINT h, UINT levels, DWORD usage, D3DFORMAT fmt, D3DPOOL pool) {
+static IDirect3DTexture9 *create_tex(IDirect3DDevice9 *dev, UINT w, UINT h, UINT levels, DWORD usage, D3DFORMAT fmt, D3DPOOL pool, D3DFORMAT *hostFmt) {
     IDirect3DTexture9 *tex = nullptr;
-    HRESULT hr = dev->CreateTexture(w, h, levels, usage, fmt, pool, &tex, nullptr);
+    /* On a driver without textureCompressionBC a DXT texture must be created
+     * as A8R8G8B8 and the compressed source decoded into it (see bc_host_format);
+     * otherwise CreateTexture fails and the guest is handed NULL. */
+    D3DFORMAT hf = (D3DFORMAT)bc_host_format(dev, (uint32_t)fmt);
+    HRESULT hr = dev->CreateTexture(w, h, levels, usage, hf, pool, &tex, nullptr);
     if (FAILED(hr)) { LOG("D3DX: CreateTexture %ux%u fmt %d levels %u -> %08x", w, h, (int)fmt, levels, (unsigned)hr); return nullptr; }
+    if (hf != fmt) bc_register_texture(tex, (uint32_t)fmt);
+    if (hostFmt) *hostFmt = hf;
     return tex;
 }
 
@@ -583,12 +595,13 @@ extern "C" void shim_D3DXCreateTextureFromFileInMemoryEx(CPU *c) {
             RET(E_NOTIMPL, 15);
         }
         D3DFORMAT fmt = reqFmt == D3DFMT_UNKNOWN ? D3DFMT_A8R8G8B8 : reqFmt;
-        IDirect3DTexture9 *tex = create_tex(dev, (UINT)w, (UINT)h, 1, usage, fmt, pool);
+        D3DFORMAT hf;
+        IDirect3DTexture9 *tex = create_tex(dev, (UINT)w, (UINT)h, 1, usage, fmt, pool, &hf);
         if (!tex) { M32(outTex) = 0; RET(E_FAIL, 15); }
         IDirect3DSurface9 *surf = nullptr;
         tex->GetSurfaceLevel(0, &surf);
         if (surf) {
-            blit_argb(surf, nullptr, px.data(), w, h, fmt);
+            blit_argb(surf, nullptr, px.data(), w, h, hf);
             surf->Release();
         }
         if (srcInfo) {
@@ -611,7 +624,8 @@ extern "C" void shim_D3DXCreateTextureFromFileInMemoryEx(CPU *c) {
     if (levels > d.mips) levels = d.mips;
     if (!levels) levels = 1;
     D3DFORMAT fmt = reqFmt == D3DFMT_UNKNOWN ? d.fmt : reqFmt;
-    IDirect3DTexture9 *tex = create_tex(dev, w, h, levels, usage, fmt, pool);
+    D3DFORMAT hf;
+    IDirect3DTexture9 *tex = create_tex(dev, w, h, levels, usage, fmt, pool, &hf);
     if (!tex) { M32(outTex) = 0; RET(E_FAIL, 15); }
     for (UINT l = 0; l < levels; l++) {
         IDirect3DSurface9 *surf = nullptr;
@@ -627,7 +641,7 @@ extern "C" void shim_D3DXCreateTextureFromFileInMemoryEx(CPU *c) {
         }
         D3DLOCKED_RECT lr;
         if (SUCCEEDED(surf->LockRect(&lr, nullptr, 0))) {
-            if (is_compressed(fmt) && fmt == d.fmt && (UINT)lw == sd.Width && (UINT)lh == sd.Height) {
+            if (is_compressed(fmt) && fmt == d.fmt && hf == fmt && (UINT)lw == sd.Width && (UINT)lh == sd.Height) {
                 // raw compressed copy, respecting the surface pitch
                 uint32_t off = d.data;
                 uint32_t lw2 = d.w, lh2 = d.h;
@@ -638,7 +652,7 @@ extern "C" void shim_D3DXCreateTextureFromFileInMemoryEx(CPU *c) {
                     memcpy((uint8_t *)lr.pBits + (size_t)y * lr.Pitch, p + off + (size_t)y * srcPitch,
                            std::min<int>(srcPitch, lr.Pitch));
             } else {
-                blit_argb(surf, nullptr, px.data(), lw, lh, fmt);
+                blit_argb(surf, nullptr, px.data(), lw, lh, hf);
             }
             surf->UnlockRect();
         }
@@ -673,9 +687,16 @@ extern "C" void shim_D3DXCreateCubeTextureFromFileInMemoryEx(CPU *c) {
     UINT levels = reqMips == D3DX_DEFAULT_ ? d.mips : std::min(reqMips, d.mips);
     if (!levels) levels = 1;
     D3DFORMAT fmt = reqFmt == D3DFMT_UNKNOWN ? d.fmt : reqFmt;
+    /* A DXT cube map must be created as A8R8G8B8 on a driver without BC and
+     * decoded below; the guest still sees DXT (bc_register_texture). Without
+     * this the Adreno driver rejects the DXT1 cube map outright -- the log
+     * shows "D3DX: CreateCubeTexture -> 8876017c" for every menu cube map --
+     * and the guest is handed a NULL texture. */
+    D3DFORMAT hf = (D3DFORMAT)bc_host_format(dev, (uint32_t)fmt);
     IDirect3DCubeTexture9 *tex = nullptr;
-    HRESULT hr = dev->CreateCubeTexture(edge, levels, usage, fmt, pool, &tex, nullptr);
+    HRESULT hr = dev->CreateCubeTexture(edge, levels, usage, hf, pool, &tex, nullptr);
     if (FAILED(hr) || !tex) { LOG("D3DX: CreateCubeTexture -> %08x", (unsigned)hr); M32(outTex) = 0; RET(E_FAIL, 14); }
+    if (hf != fmt) bc_register_texture(tex, (uint32_t)fmt);
     for (UINT f = 0; f < 6; f++) {
         for (UINT l = 0; l < levels; l++) {
             IDirect3DSurface9 *surf = nullptr;
@@ -687,7 +708,7 @@ extern "C" void shim_D3DXCreateCubeTextureFromFileInMemoryEx(CPU *c) {
             surf->GetDesc(&sd);
             D3DLOCKED_RECT lr;
             if (SUCCEEDED(surf->LockRect(&lr, nullptr, 0))) {
-                if (is_compressed(fmt) && fmt == d.fmt) {
+                if (is_compressed(fmt) && fmt == d.fmt && hf == fmt) {
                     uint32_t off = d.data, lw2 = d.w, lh2 = d.h;
                     for (UINT k = 0; k < l; k++) { off += std::max(1u, (lw2 + 3) / 4) * std::max(1u, (lh2 + 3) / 4) * block_bytes(d.fmt); lw2 = std::max(1u, lw2 >> 1); lh2 = std::max(1u, lh2 >> 1); }
                     uint32_t lsz = std::max(1u, (lw2 + 3) / 4) * std::max(1u, (lh2 + 3) / 4) * block_bytes(d.fmt);
@@ -697,7 +718,7 @@ extern "C" void shim_D3DXCreateCubeTextureFromFileInMemoryEx(CPU *c) {
                         memcpy((uint8_t *)lr.pBits + (size_t)y * lr.Pitch, p + off + (size_t)y * srcPitch,
                                std::min<int>(srcPitch, lr.Pitch));
                 } else {
-                    blit_argb(surf, nullptr, px.data(), lw, lh, fmt);
+                    blit_argb(surf, nullptr, px.data(), lw, lh, hf);
                 }
                 surf->UnlockRect();
             }

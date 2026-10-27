@@ -102,3 +102,27 @@ accepts it.
 | **Reaching the main menu anywhere** | neither the host nor the phone run gets past the first screen's UI init, so the minimum acceptance target is still unmet. |
 | **Building the APK locally** | deliberately not done: the project rule is that the APK comes only from Actions. |
 | **`d3dx9_38.dll`, `FC2.dll` redistribution** | neither is shipped or recompiled (`FC2.dll` is DRM; `d3dx9_38` is Microsoft's). |
+
+## The device actually reaches the main menu (user report, 2026-10-27)
+
+The user's third screenshot (`Screenshot_20261027-100011.png`, `2400x1080`) shows the
+**main menu rendered in full** — the notebook, "FAR CRY 2", Story Mode / Multiplayer
+/ Options / Credits / Additional Content / Quit, and "Accept". That screenshot is from
+a build newer than `apk-8` and is the first evidence that the minimum acceptance target
+is met on a phone; `docs/` had not been updated to say so. The same run, and the
+`port/log.txt` written at 13:01, show the frame counter reaching `frame 3000` with the
+watchdog recovering after a stall, so the "Press any key" freeze recorded from the
+`apk-6` run (the `pastebin` log, frozen at `frames 1506`) is no longer the current stop.
+
+Two defects visible in that log and in `Screenshot_20261027-083357.png` (the green
+"Press any key" screen) are fixed in this branch. Both are **written and syntax-checked
+locally (`clang++ -fsyntax-only`), not yet run on a phone** — the APK comes from Actions
+and no device run has used this branch yet.
+
+| What | Evidence | Change |
+|---|---|---|
+| D3DX texture creation bypasses BC emulation | `port/log.txt` lines 510–605: `DxvkError: D3D9: Cannot create texture ... D3D9Format::DXT1 ... Layers: 6` followed by `D3DX: CreateCubeTexture -> 8876017c` (D3DXERR_INVALIDDATA) five times. Adreno 660 reports `textureCompressionBC: 0`, so the raw `dev->CreateCubeTexture` in `runtime/d3dx9_host.cpp` fails and the guest is handed `NULL`. The bridge (`d3d9_bcemu.cpp`) already emulates DXT as A8R8G8B8 for `B_IDirect3DDevice9_Create*Texture`, but the D3DX host shims call the device directly and never went through it | `d3d9_bcemu.cpp` exposes `bc_host_format()` / `bc_register_texture()`; `create_tex()` and the cube-map shim create as A8R8G8B8, decode the DDS into it and register the guest DXT format so `GetLevelDesc`/`GetLockRect` still report DXT. Inactive (a no-op) when BC is supported |
+| The frame is a 1370x648 box in the corner of a 2285x1080 back buffer | `port/log.txt` line 261: `back buffer 1370x648 is not the window's aspect: using 2285x1080 (mode 0)`; the screenshots show the menu occupying the top-left ~1370x648 with the rest black. `pp_fix_size` required an *exact* `bw*wh == bh*ww`, but 1370x648 against the window's 2285x1080 differs by 0.07 % (1,080 out of 1,479,600) — pure integer rounding of the same aspect. The override then left the game rendering its own 1370x648 viewport inside the bigger back buffer | `runtime/d3d9_bridge.cpp` accepts a back buffer within 1 % of the window's aspect, so the near-window size is kept and dxvk scales it the fraction of a pixel it needs; a genuinely different aspect (e.g. 4:3) is still overridden as before |
+
+Not addressed here: the Bink videos, SEH/C++ exceptions, and the `watchdog ... (no new
+frames)` stall (which in the 13:01 log recovers — `frame 2400`/`2700`/`3000` follow it).

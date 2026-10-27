@@ -132,6 +132,27 @@ void bc_forget(void *obj) {
     g_surf.erase(obj);
 }
 
+// Public entry points for the D3DX host shims (runtime/d3dx9_host.cpp). Those
+// shims call the raw host device (dev->CreateTexture/CreateCubeTexture)
+// instead of the bridge, so without this they bypass the emulation above and a
+// DXT texture fails outright on a driver without textureCompressionBC. The
+// phone's Adreno 660 is exactly that driver: the log shows
+// "D3DX: CreateCubeTexture -> 8876017c" for every DXT1 cube map the menu asks
+// for, and the guest then gets a NULL texture.
+//
+// bc_host_format() maps a guest DXT format to the A8R8G8B8 the host can create
+// (or returns `fmt` unchanged when not emulating, so the desktop path is
+// untouched). bc_register_texture() records the guest format so descriptions
+// and locks keep reporting DXT, exactly like the bridge path.
+extern "C" uint32_t bc_host_format(IDirect3DDevice9 *d, uint32_t fmt) {
+    return (is_dxt(fmt) && bc_emulating_dev(d)) ? (uint32_t)D3DFMT_A8R8G8B8 : fmt;
+}
+extern "C" void bc_register_texture(void *tex, uint32_t guest_fmt) {
+    if (!tex) return;
+    std::lock_guard<std::mutex> l(g_bc_lock);
+    g_tex[tex] = BcTex{(D3DFORMAT)guest_fmt};
+}
+
 void B_IDirect3D9_CheckDeviceFormat(CPU *c) {
     auto *d3d = (IDirect3D9 *)com_host(ARG(0));
     uint32_t check = ARG(6);
