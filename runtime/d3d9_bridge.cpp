@@ -804,33 +804,20 @@ bool shadow_end(void *obj, uint32_t sub, uint32_t caller) {
                 if (v) nz++;
                 sum += v;
             }
-            /* The engine keeps two sets of plane textures and publishes both
-             * through the BINKFRAMEBUFFERS entries, but Bink only decodes into
-             * the set whose index equals fb->CurrentFrame. The engine then
-             * unlocks the *other* set, so what reaches the GPU is a buffer
-             * Bink never touched: all zero, which the YUV shader turns into a
-             * flat green (or black, once chroma reads 0x80) screen. The planes
-             * Bink did write are right there in the same struct, so publish
-             * the current frame's plane into the buffer being unlocked. The
-             * entry index also names the plane (0=Y, 1=U, 2=V), which is how
-             * the two 256000-byte chroma locks are told apart. */
-            int filled = 0;
-            if (fb && match >= 0 && cur < 2) {
-                int plane = match & 3;
-                uint32_t e = fb + 0x18 + 12 * (4 * cur + plane);
-                uint32_t src = M32(e + 4), pitch = M32(e + 8);
-                uint32_t h = (plane == 0) ? M32(fb + 0x08) : M32(fb + 0x10);
-                if (src >= 0x1000 && src != s.guest &&
-                    (uint64_t)pitch * h == (uint64_t)s.size) {
-                    memcpy(MEM + s.guest, MEM + src, s.size);
-                    filled = 1;
-                }
-            }
+            /* No cross-set copy here. The engine copies Bink's decoded planes
+             * into its display textures itself (the unlocked shadow already
+             * holds the full frame, see the nonzero count), and Bink's delta
+             * decoding needs each registered plane set to keep the content of
+             * its own previous decode. Copying one set's frame over the other
+             * poisoned that reference and showed up as green blocks and torn
+             * colour while the videos played. With the video-plane locks
+             * persisted (shadow_begin), every plane keeps its own chain and
+             * the engine's copy has a complete frame to work from. */
             if (n < 6 || n % 300 == 0)
                 LOG("video plane unlock #%d: %u bytes, nonzero %u sum %u, first %02x %02x %02x %02x, "
-                    "guest %08x, bink frame %u plane %08x, fb entry %d, caller %08x, filled %d",
+                    "guest %08x, bink frame %u plane %08x, fb entry %d, caller %08x",
                     n, (unsigned)s.size, nz, sum, MEM[s.guest], MEM[s.guest + 1],
-                    MEM[s.guest + 2], MEM[s.guest + 3], s.guest, cur, curplane, match, caller, filled);
+                    MEM[s.guest + 2], MEM[s.guest + 3], s.guest, cur, curplane, match, caller);
             n++;
         }
         memcpy(s.host, MEM + s.guest, s.size);
@@ -943,7 +930,20 @@ void lock_rect_common(CPU *c, void *obj, uint32_t sub, const D3DSURFACE_DESC &de
         n++;
         M32(out) = 0; M32(out + 4) = 0; return;
     }
-    if (desc.Pool != D3DPOOL_SYSTEMMEM || r) upload = nullptr;
+    /* Rect locks keep the throwaway shadow: a partial update must start from
+     * the host's current content, and only the locked range is copied back. */
+    if (r) upload = nullptr;
+    /* The Bink video planes need a persistent guest copy. Windows locks of a
+     * MANAGED texture always return the same sysmem pointer carrying the
+     * content of the last write, and Bink's delta decoding relies on that:
+     * each registered plane set must keep what its previous decode left in
+     * it, or every unchanged block of an inter frame reads zero -- the green
+     * blocks in the videos. Give the big single-plane A8 MANAGED textures
+     * (the video planes; 600x600 movies clear the 128 KiB floor too) that
+     * same persistent buffer. The unlock uploads it exactly like before. */
+    bool video_plane = desc.Format == D3DFMT_A8 && desc.Pool == D3DPOOL_MANAGED &&
+                       (size_t)desc.Width * desc.Height >= 128 * 1024;
+    if (desc.Pool != D3DPOOL_SYSTEMMEM && !video_plane) upload = nullptr;
     uint32_t g = shadow_begin(obj, sub, lr.pBits, rect_bytes(desc, r, lr.Pitch), flags, upload);
     /* The engine hands the locked pointer to Bink by writing it into the
      * BINKFRAMEBUFFERS entry (entry.plane = pBits), so the buffer logged here

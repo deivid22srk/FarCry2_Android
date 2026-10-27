@@ -131,37 +131,17 @@ static void bink_probe_fb(const char *why) {
     }
 }
 
-/* Copies the frame Bink just decoded into the *other* frame slot's planes.
- *
- * The engine hands Bink two complete sets of plane buffers (luma 1280x800 and
- * two 640x400 chroma planes each) and publishes both through this struct, but
- * Bink 1.9 only decodes into the set whose index is CurrentFrame. The engine
- * then unlocks -- and therefore uploads -- the other set, so half the plane
- * textures hold a frame from two DoFrames ago. Copying at unlock time (which
- * the D3D9 bridge also does, as a fallback) is too late for the texture that
- * is sampled but not unlocked: that one keeps stale data, which shows up as
- * green blocks and torn colour while the video plays. Filling both sets here,
- * right after the decode, makes every plane texture hold the same complete
- * frame whichever one the engine samples next. */
-static void bink_publish(void) {
-    uint32_t fb = g_bk_fb;
-    if (!fb) return;
-    uint32_t cur = M32(fb + 0x14);
-    if (cur > 1) return;
-    uint32_t other = 1 - cur;
-    for (int p = 0; p < 3; p++) {
-        uint32_t src    = M32(fb + 0x18 + 12 * (cur * 4 + (uint32_t)p) + 4);
-        uint32_t spitch = M32(fb + 0x18 + 12 * (cur * 4 + (uint32_t)p) + 8);
-        uint32_t dst    = M32(fb + 0x18 + 12 * (other * 4 + (uint32_t)p) + 4);
-        uint32_t dpitch = M32(fb + 0x18 + 12 * (other * 4 + (uint32_t)p) + 8);
-        uint32_t rows   = (p == 0) ? M32(fb + 0x08) : M32(fb + 0x10);
-        if (!src || !spitch || !dst || !dpitch || !rows) continue;
-        if (src == dst && spitch == dpitch) continue;
-        uint32_t n = spitch < dpitch ? spitch : dpitch;
-        for (uint32_t y = 0; y < rows; y++)
-            memcpy(MEM + dst + y * dpitch, MEM + src + y * spitch, n);
-    }
-}
+/* The engine copies Bink's decoded planes into its display textures itself
+ * (the unlock census in the D3D9 bridge shows the display shadow already
+ * holding the full frame before any help), so no cross-set copy is done
+ * here. Filling the *other* plane set from the current one used to look
+ * attractive -- Bink only decodes into the set whose index is CurrentFrame --
+ * but each set is a rotating buffer whose content must survive to serve as
+ * the reference for its own next decode; overwriting it with the newest
+ * frame desynchronised every following inter frame and showed up as green
+ * blocks and torn colour. The plane locks are persisted instead (see the
+ * D3D9 bridge), which gives both sets the Windows behaviour they were
+ * built for: a stable buffer that keeps the previous frame's content. */
 
 /* 16x8 luma plus 8x4 chroma thumbnail of the decoded frame, averaged. A flat
  * green screen, a black band on one edge, a wrong value range (0..255 versus
@@ -228,7 +208,6 @@ static void shim_bk_BinkDoFrame(CPU *c) {
     }
     if (probes < 3) { probes++; bink_probe_fb("decoded"); }
     if (!r) {
-        bink_publish();
         static uint32_t frames;
         if ((frames++ % 30) == 0) bink_thumb();
     }
