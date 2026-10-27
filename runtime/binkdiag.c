@@ -79,15 +79,85 @@ BINK_WRAPPER(BinkPause,                 2, 1, A2_PTRS)
 BINK_WRAPPER(BinkNextFrame,             1, 0, A_BINK)
 BINK_WRAPPER(BinkGoto,                  3, 1, A3_PTRS)
 BINK_WRAPPER(BinkClose,                 1, 1, A1_PTR)
-BINK_WRAPPER(BinkRegisterFrameBuffers,  2, 1, A2_PTRS)
 BINK_WRAPPER(BinkGetFrameBuffersInfo,   2, 1, A2_PTRS)
 BINK_WRAPPER(BinkOpen,                  2, 1, A0_NAME)
 BINK_WRAPPER(BinkLogoAddress,           0, 1, A_NONE)
-BINK_WRAPPER(BinkDoFrame,               1, 0, A_BINK)
 BINK_WRAPPER(BinkOpenDirectSound,       1, 1, A1_PTR)
 BINK_WRAPPER(BinkWait,                  1, 0, A_BINK)
 BINK_WRAPPER(BinkSetVolume,             3, 1, A3_PTRS)
 BINK_WRAPPER(BinkSetSoundOnOff,         2, 1, A2_PTRS)
+
+/* --- Bink frame buffers -------------------------------------------------
+ *
+ * Dunia does not use BinkCopyToBuffer: it asks BinkGetFrameBuffersInfo for
+ * the plane geometry, allocates the planes itself and hands them over with
+ * BinkRegisterFrameBuffers. Bink then decodes straight into that memory and
+ * the engine uploads the planes to A8 textures that a YUV pixel shader
+ * samples.
+ *
+ * A flat green rectangle is what that shader produces from an all-zero YUV
+ * triple, so either Bink never wrote the planes or the upload to the
+ * textures never happened -- and the log cannot tell those apart today.
+ * Dump the BINKFRAMEBUFFERS block and sample every word in it that looks
+ * like a pointer: after BinkRegisterFrameBuffers the planes are still blank,
+ * after BinkDoFrame they must not be. One run then says which side is at
+ * fault.
+ *
+ * Guest memory is one 4 GB reservation, so any guest pointer below 4 GB is
+ * safe to read (untouched pages read as zero), and the 24-word dump also
+ * shows the layout if this Bink build orders the fields differently. */
+static uint32_t g_bk_fb;
+
+static void bink_probe_fb(const char *why) {
+    uint32_t w[24];
+    if (!g_bk_fb) return;
+    for (int i = 0; i < 24; i++) w[i] = M32(g_bk_fb + (uint32_t)i * 4);
+    LOG("bink: fb(%s) %08x +00: %08x %08x %08x %08x %08x %08x %08x %08x", why,
+        g_bk_fb, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+    LOG("bink: fb %08x +20: %08x %08x %08x %08x %08x %08x %08x %08x",
+        g_bk_fb, w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
+    LOG("bink: fb %08x +40: %08x %08x %08x %08x %08x %08x %08x %08x",
+        g_bk_fb, w[16], w[17], w[18], w[19], w[20], w[21], w[22], w[23]);
+    for (int i = 0; i < 24; i++) {
+        uint32_t p = w[i];
+        if (p < 0x10000) continue;              /* a size or pitch, not a pointer */
+        uint32_t nz = 0, sum = 0;
+        for (uint32_t k = 0; k < 4096; k++) {
+            uint8_t v = M8(p + k);
+            if (v) nz++;
+            sum += v;
+        }
+        LOG("bink:   +%02x = %08x: nonzero %u/4096 sum %u", i * 4, p, nz, sum);
+    }
+}
+
+static struct { uint32_t real; uint32_t calls; } g_bk_BinkRegisterFrameBuffers;
+static struct { uint32_t real; uint32_t calls; } g_bk_BinkDoFrame;
+
+static void shim_bk_BinkRegisterFrameBuffers(CPU *c) {
+    uint32_t a[2] = { ARG(0), ARG(1) };
+    g_bk_fb = a[1];
+    if (!g_bk_BinkRegisterFrameBuffers.real) { RET(0, 2); }
+    uint32_t r = rt_invoke(c, g_bk_BinkRegisterFrameBuffers.real, 2, a);
+    LOG("bink: BinkRegisterFrameBuffers(p=%08x, fb=%08x) -> %08x", a[0], a[1], r);
+    bink_probe_fb("registered");
+    RET(r, 2);
+}
+
+static void shim_bk_BinkDoFrame(CPU *c) {
+    static uint32_t probes;
+    uint32_t a[1] = { ARG(0) };
+    if (!g_bk_BinkDoFrame.real) { RET(0, 1); }
+    uint32_t r = rt_invoke(c, g_bk_BinkDoFrame.real, 1, a);
+    if (bink_log_gate(&g_bk_BinkDoFrame.calls)) {
+        char abuf[192];
+        A_BINK(abuf, sizeof abuf);
+        LOG("bink: BinkDoFrame(%s) -> %08x (call %u)", abuf, r,
+            g_bk_BinkDoFrame.calls);
+    }
+    if (probes < 3) { probes++; bink_probe_fb("decoded"); }
+    RET(r, 1);
+}
 
 static const struct { const char *name; ShimFn fn; } k_wrapped[] = {
     { "_BinkSetSoundSystem@8",       shim_bk_BinkSetSoundSystem },

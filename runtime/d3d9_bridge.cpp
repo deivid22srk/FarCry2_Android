@@ -664,12 +664,41 @@ void B_IDirect3DSwapChain9_GetPresentParameters(CPU *c) {
 
 // Sources may be system-memory textures written through a persistent lock
 // pointer; push those writes to the host first.
+//
+// Both uploads used to return their HRESULT without a word. A rejected
+// upload (format mismatch, missing subresource, unusable source) leaves the
+// destination exactly as it was, and the game has no way to notice: the
+// video planes stay zeroed and the player sees the green YUV-without-data
+// colour. Log the first few successes so the upload path is visible, and
+// every failure.
+static int g_update_logs;
+
+static void log_base_texture(const char *what, IDirect3DBaseTexture9 *t) {
+    if (!t) { LOG("  %s = null", what); return; }
+    if (t->GetType() == D3DRTYPE_TEXTURE) {
+        D3DSURFACE_DESC d;
+        ((IDirect3DTexture9 *)t)->GetLevelDesc(0, &d);
+        LOG("  %s = tex %ux%u fmt %x pool %u", what, d.Width, d.Height,
+            (unsigned)d.Format, (unsigned)d.Pool);
+    } else {
+        LOG("  %s = type %d at %08x", what, (int)t->GetType(),
+            (uint32_t)(uintptr_t)t);
+    }
+}
+
 void B_IDirect3DDevice9_UpdateTexture(CPU *c) {
     auto *dev = (IDirect3DDevice9 *)com_host(ARG(0));
     auto *src = (IDirect3DBaseTexture9 *)com_host(ARG(1));
     auto *dst = (IDirect3DBaseTexture9 *)com_host(ARG(2));
     shadow_flush(src);
-    RET(dev->UpdateTexture(src, dst), 3);
+    HRESULT hr = dev->UpdateTexture(src, dst);
+    if (FAILED(hr) || g_update_logs < 4) {
+        LOG("UpdateTexture -> %08x", (unsigned)hr);
+        log_base_texture("src", src);
+        log_base_texture("dst", dst);
+        g_update_logs++;
+    }
+    RET(hr, 3);
 }
 
 void B_IDirect3DDevice9_UpdateSurface(CPU *c) {
@@ -677,7 +706,18 @@ void B_IDirect3DDevice9_UpdateSurface(CPU *c) {
     auto *src = (IDirect3DSurface9 *)com_host(ARG(1));
     auto *dst = (IDirect3DSurface9 *)com_host(ARG(3));
     shadow_flush(src);
-    RET(dev->UpdateSurface(src, (const RECT *)GPTR(ARG(2)), dst, (const POINT *)GPTR(ARG(4))), 5);
+    HRESULT hr = dev->UpdateSurface(src, (const RECT *)GPTR(ARG(2)), dst,
+                                    (const POINT *)GPTR(ARG(4)));
+    if (FAILED(hr) || g_update_logs < 4) {
+        D3DSURFACE_DESC sd = {}, dd = {};
+        if (src) src->GetDesc(&sd);
+        if (dst) dst->GetDesc(&dd);
+        LOG("UpdateSurface %ux%u fmt %x pool %u -> %ux%u fmt %x pool %u: %08x",
+            sd.Width, sd.Height, (unsigned)sd.Format, (unsigned)sd.Pool,
+            dd.Width, dd.Height, (unsigned)dd.Format, (unsigned)dd.Pool, (unsigned)hr);
+        g_update_logs++;
+    }
+    RET(hr, 5);
 }
 
 // ---------------------------------------------------------------- locks
@@ -737,7 +777,30 @@ bool shadow_end(void *obj, uint32_t sub) {
         v.erase(v.begin() + k);
         if (v.empty()) g_shadows.erase(it);
     }
-    if (!(s.flags & D3DLOCK_READONLY)) memcpy(s.host, MEM + s.guest, s.size);
+    if (!(s.flags & D3DLOCK_READONLY)) {
+        /* The title screen is a Bink movie drawn by a YUV shader that samples
+         * three 8-bit planes; press_start.bik is 1280x800, so its luma plane
+         * locks as 1024000 bytes and each chroma plane as 256000. If the
+         * engine pushes the decoded planes here the sums are non-zero, and a
+         * flat green screen means they are not -- which tells this apart from
+         * Bink failing to fill its frame buffers (probed in binkdiag.c). */
+        if ((s.size >= 1000000 && s.size <= 1080000) ||
+            (s.size >= 250000 && s.size <= 262000)) {
+            static int n;
+            uint32_t nz = 0, sum = 0;
+            for (size_t k = 0; k < s.size; k++) {
+                uint8_t v = MEM[s.guest + k];
+                if (v) nz++;
+                sum += v;
+            }
+            if (n < 6 || n % 300 == 0)
+                LOG("video plane unlock #%d: %u bytes, nonzero %u sum %u, first %02x %02x %02x %02x",
+                    n, (unsigned)s.size, nz, sum, MEM[s.guest], MEM[s.guest + 1],
+                    MEM[s.guest + 2], MEM[s.guest + 3]);
+            n++;
+        }
+        memcpy(s.host, MEM + s.guest, s.size);
+    }
     if (!s.persist) gfree(s.guest);
     return true;
 }
@@ -833,7 +896,19 @@ size_t rect_bytes(const D3DSURFACE_DESC &desc, const RECT *r, INT pitch) {
 void lock_rect_common(CPU *c, void *obj, uint32_t sub, const D3DSURFACE_DESC &desc, HRESULT hr,
                       const D3DLOCKED_RECT &lr, const RECT *r, DWORD flags, uint32_t out,
                       std::function<void(const uint8_t *)> upload = nullptr) {
-    if (FAILED(hr)) { M32(out) = 0; M32(out + 4) = 0; return; }
+    if (FAILED(hr)) {
+        // The guest is handed pBits = 0 and Pitch = 0. Most engines test the
+        // HRESULT and skip the copy, so a texture that fails to lock just
+        // keeps its old contents -- which is invisible unless the failure is
+        // logged here.
+        static int n;
+        if (n < 8 || n % 500 == 0)
+            LOG("lock failed #%d: %ux%u fmt %x pool %u flags %x hr %08x", n,
+                desc.Width, desc.Height, (unsigned)desc.Format, (unsigned)desc.Pool,
+                (unsigned)flags, (unsigned)hr);
+        n++;
+        M32(out) = 0; M32(out + 4) = 0; return;
+    }
     if (desc.Pool != D3DPOOL_SYSTEMMEM || r) upload = nullptr;
     uint32_t g = shadow_begin(obj, sub, lr.pBits, rect_bytes(desc, r, lr.Pitch), flags, upload);
     M32(out) = (uint32_t)lr.Pitch;
@@ -927,7 +1002,15 @@ void B_IDirect3DCubeTexture9_UnlockRect(CPU *c) {
 
 static void lock_box_common(void *obj, uint32_t sub, const D3DVOLUME_DESC &desc, HRESULT hr,
                             const D3DLOCKED_BOX &lb, const D3DBOX *b, DWORD flags, uint32_t out) {
-    if (FAILED(hr)) { M32(out) = M32(out + 4) = M32(out + 8) = 0; return; }
+    if (FAILED(hr)) {
+        static int n;
+        if (n < 8 || n % 500 == 0)
+            LOG("lockbox failed #%d: %ux%ux%u fmt %x pool %u flags %x hr %08x", n,
+                desc.Width, desc.Height, desc.Depth, (unsigned)desc.Format,
+                (unsigned)desc.Pool, (unsigned)flags, (unsigned)hr);
+        n++;
+        M32(out) = M32(out + 4) = M32(out + 8) = 0; return;
+    }
     uint32_t depth = b ? b->Back - b->Front : desc.Depth;
     size_t size = (size_t)lb.SlicePitch * depth;
     uint32_t g = shadow_begin(obj, sub, lb.pBits, size, flags);
