@@ -131,6 +131,77 @@ static void bink_probe_fb(const char *why) {
     }
 }
 
+/* Copies the frame Bink just decoded into the *other* frame slot's planes.
+ *
+ * The engine hands Bink two complete sets of plane buffers (luma 1280x800 and
+ * two 640x400 chroma planes each) and publishes both through this struct, but
+ * Bink 1.9 only decodes into the set whose index is CurrentFrame. The engine
+ * then unlocks -- and therefore uploads -- the other set, so half the plane
+ * textures hold a frame from two DoFrames ago. Copying at unlock time (which
+ * the D3D9 bridge also does, as a fallback) is too late for the texture that
+ * is sampled but not unlocked: that one keeps stale data, which shows up as
+ * green blocks and torn colour while the video plays. Filling both sets here,
+ * right after the decode, makes every plane texture hold the same complete
+ * frame whichever one the engine samples next. */
+static void bink_publish(void) {
+    uint32_t fb = g_bk_fb;
+    if (!fb) return;
+    uint32_t cur = M32(fb + 0x14);
+    if (cur > 1) return;
+    uint32_t other = 1 - cur;
+    for (int p = 0; p < 3; p++) {
+        uint32_t src    = M32(fb + 0x18 + 12 * (cur * 4 + (uint32_t)p) + 4);
+        uint32_t spitch = M32(fb + 0x18 + 12 * (cur * 4 + (uint32_t)p) + 8);
+        uint32_t dst    = M32(fb + 0x18 + 12 * (other * 4 + (uint32_t)p) + 4);
+        uint32_t dpitch = M32(fb + 0x18 + 12 * (other * 4 + (uint32_t)p) + 8);
+        uint32_t rows   = (p == 0) ? M32(fb + 0x08) : M32(fb + 0x10);
+        if (!src || !spitch || !dst || !dpitch || !rows) continue;
+        if (src == dst && spitch == dpitch) continue;
+        uint32_t n = spitch < dpitch ? spitch : dpitch;
+        for (uint32_t y = 0; y < rows; y++)
+            memcpy(MEM + dst + y * dpitch, MEM + src + y * spitch, n);
+    }
+}
+
+/* 16x8 luma plus 8x4 chroma thumbnail of the decoded frame, averaged. A flat
+ * green screen, a black band on one edge, a wrong value range (0..255 versus
+ * 16..235) and swapped chroma all look different here, and the numbers travel
+ * in the log -- no screenshot needed to see what the video really contains. */
+static void bink_thumb(void) {
+    uint32_t fb = g_bk_fb;
+    if (!fb) return;
+    uint32_t cur = M32(fb + 0x14);
+    if (cur > 1) return;
+    char out[512];
+    int o = 0;
+    for (int p = 0; p < 3; p++) {
+        uint32_t src   = M32(fb + 0x18 + 12 * (cur * 4 + (uint32_t)p) + 4);
+        uint32_t pitch = M32(fb + 0x18 + 12 * (cur * 4 + (uint32_t)p) + 8);
+        uint32_t w     = (p == 0) ? M32(fb + 0x04) : M32(fb + 0x0C);
+        uint32_t h     = (p == 0) ? M32(fb + 0x08) : M32(fb + 0x10);
+        int cw = (p == 0) ? 16 : 8, ch = (p == 0) ? 8 : 4;
+        if (!src || !pitch || !w || !h) continue;
+        out[o++] = (p == 0) ? 'Y' : (p == 1 ? 'U' : 'V');
+        out[o++] = ':';
+        for (int j = 0; j < ch; j++)
+            for (int i = 0; i < cw; i++) {
+                uint32_t x0 = (uint32_t)i * w / (uint32_t)cw;
+                uint32_t x1 = (uint32_t)(i + 1) * w / (uint32_t)cw;
+                uint32_t y0 = (uint32_t)j * h / (uint32_t)ch;
+                uint32_t y1 = (uint32_t)(j + 1) * h / (uint32_t)ch;
+                uint32_t sum = 0, n = 0;
+                for (uint32_t y = y0; y < y1; y += 4)
+                    for (uint32_t x = x0; x < x1; x += 4) { sum += M8(src + y * pitch + x); n++; }
+                unsigned v = n ? sum / n : 0;
+                out[o++] = "0123456789abcdef"[v >> 4];
+                out[o++] = "0123456789abcdef"[v & 15];
+            }
+        out[o++] = ' ';
+    }
+    out[o] = 0;
+    LOG("bink: thumb %s", out);
+}
+
 static struct { uint32_t real; uint32_t calls; } g_bk_BinkRegisterFrameBuffers;
 static struct { uint32_t real; uint32_t calls; } g_bk_BinkDoFrame;
 
@@ -156,6 +227,11 @@ static void shim_bk_BinkDoFrame(CPU *c) {
             g_bk_BinkDoFrame.calls);
     }
     if (probes < 3) { probes++; bink_probe_fb("decoded"); }
+    if (!r) {
+        bink_publish();
+        static uint32_t frames;
+        if ((frames++ % 30) == 0) bink_thumb();
+    }
     RET(r, 1);
 }
 
