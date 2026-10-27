@@ -174,3 +174,98 @@ now formats its arguments into a buffer first, so the log prints
 
 Both are **written and syntax-checked only**; the APK still comes from Actions and
 no phone run has used them yet.
+
+## The green video blocks and the story-mode black screen (`6log.txt` + the gameplay recording, 2026-10-27)
+
+The run behind the `fix/bink-plane-probe` probe build (the user's `6log.txt` and
+the 71 s screen recording) gets **all the way into the story mode**: the title
+video plays, the main menu renders in full, "New Story" starts the intro, and
+the intro's bar/savanna scenes render. Three defects are visible in it.
+
+### 1. Green macroblocks in every video
+
+The recording shows the Ubisoft logo video playing with 16x16-block-shaped
+green patches everywhere nothing moves, and the same green bleeding through
+the title screen. Green is what the YUV shader produces for a chroma value of
+zero, so the displayed planes contain zeroed blocks — Bink's *inter frames*
+wrote only the blocks that changed since the previous frame, and everything
+else stayed at whatever the buffer held.
+
+What the log shows, step by step:
+
+* the engine locks its plane textures every frame — the *decode* set with
+  `D3DLOCK_READONLY` (`flags 10`, handed to Bink through the
+  BINKFRAMEBUFFERS entries) and the *display* set with plain read-write locks;
+* the bridge hands every lock a **fresh, zeroed guest shadow**, so each new
+  lock erased the previous frame's content from the buffer Bink was about to
+  apply deltas onto. On Windows a `D3DPOOL_MANAGED` lock returns the *same*
+  sysmem pointer with the content of the last write — the rotating plane sets
+  keep their chains, which is what Bink's model requires;
+* the decoded frame itself is fine (`bink: thumb` shows real picture data
+  every 30 frames), the engine copies it into its display textures itself —
+  the unlock census prints `nonzero 1024000` for a display luma plane *before*
+  the bridge's old fallback touched it — so the holes in the decode targets
+  are what reached the screen.
+
+Two workarounds that had been added earlier (`bink_publish` after every
+`BinkDoFrame`, and the unlock-time "publish the current frame's plane" copy in
+the bridge) made it worse: each set is a rotating buffer whose content must
+survive as the reference for its own next decode, so copying the newest frame
+over the *other* set desynchronised every following inter frame — and when the
+current set's chroma happened to be empty (decode 2 in the log: Y written,
+U/V skipped because nothing changed), the copies spread zeros around.
+
+**Change** (all in `runtime/`):
+
+* `runtime/d3d9_bridge.cpp`: the big single-plane A8 MANAGED textures (the
+  Bink planes; 600x600 movies clear the 128 KiB floor) now lock through the
+  persistent-guest-copy path — one guest buffer per (texture, level), kept
+  across locks, guest copy authoritative, uploaded on unlock exactly like the
+  SYSTEMMEM path already did. That reproduces the Windows MANAGED behaviour
+  the engine was built against.
+* the unlock-time cross-set copy is gone (the census log stays, so the next
+  run still shows per-plane content);
+* `runtime/binkdiag.c`: `bink_publish()` is removed with it.
+
+### 2. The story mode goes black after the intro
+
+After the intro movies close, the story world load starts (save-game scans,
+`downloadcontent`/`worlds` probes, the loading-screen DXT3 texture, the first
+compressed vertex formats — types 5/6/7/9/10, the world's packed streams) and
+the frame counter keeps advancing, but the screen stays black. Nothing faults;
+the render thread eventually just idles.
+
+One concrete defect fits: **`ReadFile` used to return whatever one `read(2)`
+gave it.** Over Android's FUSE storage (`/storage/emulated/0`) a single read
+is silently capped at the connection's `max_read` (128 KiB there), and it
+comes back as *success*. The engine's pack/world loaders issue multi-megabyte
+reads and trust the count, so everything past the first 128 KiB of every big
+read was garbage — small reads (intro, menus) worked, the world load did not.
+`runtime/kernel32.c` now loops each `ReadFile` until the buffer is full, EOF
+or a real error, which is what a Windows disk read does; read failures are
+logged (rate-limited) instead of silently becoming EOF.
+
+Two log gaps that hid the story-load path are closed as well: `CreateFileA`
+failures under `data_win32` are now LOG-level (rate-limited), and
+`FindFirstFileW` says when a *file* pattern (worlds.dat, dominos.dat, ...)
+matched nothing — the folder-missing case was already visible, the
+file-missing case was silent.
+
+### 3. Audio is silent end to end
+
+The recording's audio track is digital silence, and the mixer census says
+`0 playing` for the whole run: the engine created 194 DirectSound buffers and
+destroyed all 194, with exactly **one** `Play` call in the entire log (the
+startup blip). The XAudio2 shim is never reached (no `CoCreateInstance` of
+either CLSID). Whatever gates the engine's decision to play — most likely
+something in the EAX-off fallback path or the 3D-buffer LOCDEFER handling —
+needs its own investigation; nothing was changed here in this round.
+
+### What the next phone log should show
+
+* video plane unlocks whose `nonzero` count stays high for *every* plane
+  (no more `nonzero 0` chroma), no `filled` column (the copy is gone);
+* green gone from the title screen and the intro videos;
+* `ReadFile ... failed` lines if any data read actually fails;
+* `CreateFileA failed ... data_win32` / `FindFirstFileW ... no match` lines
+  naming exactly which story-load file is missing, if that is the stall.
