@@ -374,7 +374,8 @@ static uint32_t surface_pitch(D3DSURFACE_DESC *d) {
 static void blit_argb(IDirect3DSurface9 *s, const RECT *dstRect, const uint32_t *px, int w, int h, D3DFORMAT fmt) {
     D3DLOCKED_RECT lr;
     RECT r = dstRect ? *dstRect : RECT{0, 0, (LONG)w, (LONG)h};
-    if (FAILED(s->LockRect(&lr, &r, 0))) { LOG("D3DX: LockRect failed"); return; }
+    HRESULT hr = s->LockRect(&lr, &r, 0);
+    if (FAILED(hr)) { LOG("D3DX: LockRect failed (%dx%d fmt %d hr %08x)", (int)(r.right - r.left), (int)(r.bottom - r.top), (int)fmt, (unsigned)hr); return; }
     uint8_t *base = (uint8_t *)lr.pBits;
     int rw = (int)(r.right - r.left), rh = (int)(r.bottom - r.top);
     if (is_compressed(fmt)) {
@@ -639,10 +640,16 @@ extern "C" void shim_D3DXCreateTextureFromFileInMemoryEx(CPU *c) {
             surf->Release();
             break;
         }
-        D3DLOCKED_RECT lr;
-        if (SUCCEEDED(surf->LockRect(&lr, nullptr, 0))) {
-            if (is_compressed(fmt) && fmt == d.fmt && hf == fmt && (UINT)lw == sd.Width && (UINT)lh == sd.Height) {
-                // raw compressed copy, respecting the surface pitch
+        /* The two cases must be exclusive: blit_argb() locks and unlocks the
+         * surface itself, so locking here and then calling blit_argb() inside
+         * the same lock made DXVK refuse the second lock ("Don't allow
+         * multiple lockings", D3DERR_INVALIDCALL). The log filled with 234
+         * "D3DX: LockRect failed" -- one per cube face level -- and the DDS
+         * data never reached the texture. */
+        if (is_compressed(fmt) && fmt == d.fmt && hf == fmt && (UINT)lw == sd.Width && (UINT)lh == sd.Height) {
+            // raw compressed copy, respecting the surface pitch
+            D3DLOCKED_RECT lr;
+            if (SUCCEEDED(surf->LockRect(&lr, nullptr, 0))) {
                 uint32_t off = d.data;
                 uint32_t lw2 = d.w, lh2 = d.h;
                 for (UINT k = 0; k < l; k++) { off += (std::max(1u, (lw2 + 3) / 4) * std::max(1u, (lh2 + 3) / 4) * block_bytes(d.fmt)); lw2 = std::max(1u, lw2 >> 1); lh2 = std::max(1u, lh2 >> 1); }
@@ -651,10 +658,10 @@ extern "C" void shim_D3DXCreateTextureFromFileInMemoryEx(CPU *c) {
                 for (int y = 0; y < rows; y++)
                     memcpy((uint8_t *)lr.pBits + (size_t)y * lr.Pitch, p + off + (size_t)y * srcPitch,
                            std::min<int>(srcPitch, lr.Pitch));
-            } else {
-                blit_argb(surf, nullptr, px.data(), lw, lh, hf);
+                surf->UnlockRect();
             }
-            surf->UnlockRect();
+        } else {
+            blit_argb(surf, nullptr, px.data(), lw, lh, hf);
         }
         surf->Release();
     }
@@ -706,9 +713,12 @@ extern "C" void shim_D3DXCreateCubeTextureFromFileInMemoryEx(CPU *c) {
             if (!load_dds_level(p, n, &d, f, l, &px, &lw, &lh)) { surf->Release(); break; }
             D3DSURFACE_DESC sd;
             surf->GetDesc(&sd);
-            D3DLOCKED_RECT lr;
-            if (SUCCEEDED(surf->LockRect(&lr, nullptr, 0))) {
-                if (is_compressed(fmt) && fmt == d.fmt && hf == fmt) {
+            if (is_compressed(fmt) && fmt == d.fmt && hf == fmt) {
+                /* raw compressed copy, respecting the surface pitch. blit_argb()
+                 * is not used here because it locks the surface itself, and the
+                 * outer lock below would make the second lock fail. */
+                D3DLOCKED_RECT lr;
+                if (SUCCEEDED(surf->LockRect(&lr, nullptr, 0))) {
                     uint32_t off = d.data, lw2 = d.w, lh2 = d.h;
                     for (UINT k = 0; k < l; k++) { off += std::max(1u, (lw2 + 3) / 4) * std::max(1u, (lh2 + 3) / 4) * block_bytes(d.fmt); lw2 = std::max(1u, lw2 >> 1); lh2 = std::max(1u, lh2 >> 1); }
                     uint32_t lsz = std::max(1u, (lw2 + 3) / 4) * std::max(1u, (lh2 + 3) / 4) * block_bytes(d.fmt);
@@ -717,10 +727,10 @@ extern "C" void shim_D3DXCreateCubeTextureFromFileInMemoryEx(CPU *c) {
                     for (int y = 0; y < rows; y++)
                         memcpy((uint8_t *)lr.pBits + (size_t)y * lr.Pitch, p + off + (size_t)y * srcPitch,
                                std::min<int>(srcPitch, lr.Pitch));
-                } else {
-                    blit_argb(surf, nullptr, px.data(), lw, lh, hf);
+                    surf->UnlockRect();
                 }
-                surf->UnlockRect();
+            } else {
+                blit_argb(surf, nullptr, px.data(), lw, lh, hf);
             }
             surf->Release();
         }

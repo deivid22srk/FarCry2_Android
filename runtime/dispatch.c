@@ -170,6 +170,31 @@ void rt_watchdog_start(void) {
     pthread_detach(th);
 }
 
+/* ---- named trace points -------------------------------------------------
+ * The game glue names a few guest entry points whose first call is worth a log
+ * line. Far Cry 2 uses this for the recompiled binkw32 decoder: the "press any
+ * key" screen draws press_start.bik and the story intro is another Bink movie,
+ * so a log that never shows a _Bink* entry means playback was never reached,
+ * and one that shows _BinkOpen returning 0 means the movie failed to open. */
+#define MAX_TRACEPTS 24
+static struct { uint32_t addr; const char *name; int state; } g_tracepts[MAX_TRACEPTS];
+static int g_ntracepts;
+
+void rt_trace_point(uint32_t addr, const char *name) {
+    if (addr && g_ntracepts < MAX_TRACEPTS) {
+        g_tracepts[g_ntracepts].addr = addr;
+        g_tracepts[g_ntracepts].name = name;
+        g_tracepts[g_ntracepts].state = 0;
+        g_ntracepts++;
+    }
+}
+
+static int trace_pt_index(uint32_t t) {
+    for (int i = 0; i < g_ntracepts; i++)
+        if (g_tracepts[i].addr == t) return i;
+    return -1;
+}
+
 void rt_call(CPU *c, uint32_t t) {
     if (t >= GUEST_THUNK_BASE) {
         uint32_t i = (t - GUEST_THUNK_BASE) / 4;
@@ -194,7 +219,17 @@ void rt_call(CPU *c, uint32_t t) {
         }
         rt_fatal("no recompiled code at %08x (return address %08x)", t, ret);
     }
+    int ti = g_ntracepts ? trace_pt_index(t) : -1;
+    if (ti >= 0 && !g_tracepts[ti].state) {
+        g_tracepts[ti].state = 1;
+        LOG("trace: %s(%08x, %08x, %08x, %08x)", g_tracepts[ti].name,
+            M32(c->r[4] + 4), M32(c->r[4] + 8), M32(c->r[4] + 12), M32(c->r[4] + 16));
+    }
     fn(c);
+    if (ti >= 0 && g_tracepts[ti].state == 1) {
+        g_tracepts[ti].state = 2;
+        LOG("trace: %s -> %08x", g_tracepts[ti].name, c->r[0]);
+    }
 }
 
 uint32_t rt_invoke(CPU *c, uint32_t fn, int nargs, const uint32_t *args) {

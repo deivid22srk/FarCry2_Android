@@ -126,3 +126,26 @@ and no device run has used this branch yet.
 
 Not addressed here: the Bink videos, SEH/C++ exceptions, and the `watchdog ... (no new
 frames)` stall (which in the 13:01 log recovers — `frame 2400`/`2700`/`3000` follow it).
+
+## The D3DX lock regression, and what the "green" actually is (2026-10-27, later)
+
+The user installed the `apk-9-20261027-1352` build from the branch above and sent
+`port/3log.txt` (13:58, 809 lines). The aspect fix is confirmed in it:
+`touch: back buffer 1370x648, window 2285x1080, aspect 2.1157` and
+`Presenter: Buffer size: 2285x1080`. The game reaches `frame 3300` (`watchdog 90s:
+frames 3295`) and the watchdog no longer reports a stall.
+
+Two things the log shows, both fixed here (again **syntax-checked only, not yet run**):
+
+| What | Evidence | Change |
+|---|---|---|
+| `D3DX: LockRect failed` x **234** — exactly 6 faces x (8+8+8+8+7) mip levels of the five DXT cube maps | every call site in `d3dx9_host.cpp` locked the surface itself and then called `blit_argb()`, which locks the same surface again. DXVK rejects the nested lock (`D3D9DeviceEx::LockImage`: *"Don't allow multiple lockings"*, `D3DERR_INVALIDCALL`), so the lock that produced the regression was the *inner* one and the DDS bytes never reached the texture. Before the BC fix the emulated branch was never taken, so the bug was latent | the raw-copy and `blit_argb()` branches are now exclusive in both the 2-D and cube DDS paths; the failure log also prints the HRESULT and rect |
+| the "Press any key" screen is green | `strings` over `Data_Win32/common.dat` shows the menu movie list: `UI\video\ending.bik`, `UI\video\press_start.bik`, `video\bink_*`. `press_start.bik` is the background of that screen, i.e. **a Bink movie**; `Data_Win32/ui/video/` ships only `ending.bik` loose, so the movie comes out of `common.dat` | new `rt_trace_point()` (dispatch.c) is registered for the 16 `_Bink*` entry points in `main.c`; each logs its arguments and result the first time it is called. The next log says whether playback is reached and whether `_BinkOpen` returns 0 |
+
+So the green title screen and the black story-mode opening are expected to be the
+**same** fault: a Bink movie that is never decoded (or whose texture is never filled).
+The trace above is what tells us which. The recompiled `binkw32.dll` is present
+(`gen/bink_*.c`, 442 functions, `0x09001000`–`0x0901FDD0`) and bound after the second
+`bind_imports()` pass; five functions were rejected by the lifter
+(`0x9001A14`, `0x900905C`, `0x900C9C4`, `0x900CCF4`, `0x901F8B4`), none of which the log
+has aborted on so far.

@@ -571,6 +571,22 @@ int main(int argc, char **argv) {
      * export table before its thunk cache, so the second pass takes effect). */
     for (int i = 0; i < ndll; i++) bind_imports(g_dll_bases[i]);
     bind_imports(g_exe_base);
+#if defined(GAME_FC2)
+    /* The "press any key" background (press_start.bik) and the story intro are
+     * Bink movies. Name the decoder entry points so the log shows the first
+     * call to each with its arguments and result: no line means playback was
+     * never reached, a 0 from _BinkOpen means the movie failed to open. */
+    {
+        static const char *const bink_entries[] = {
+            "_BinkOpen@8", "_BinkDoFrame@4", "_BinkNextFrame@4", "_BinkWait@4",
+            "_BinkShouldSkip@4", "_BinkPause@8", "_BinkGoto@12", "_BinkClose@4",
+            "_BinkRegisterFrameBuffers@8", "_BinkGetFrameBuffersInfo@8",
+            "_BinkSetSoundSystem@8", "_BinkOpenDirectSound@4", "_BinkSetSoundOnOff@8",
+            "_BinkSetVolume@12", "_BinkSetMemory@8", "_BinkLogoAddress@0", NULL };
+        for (int i = 0; bink_entries[i]; i++)
+            rt_trace_point(rt_import_opt("binkw32.dll", bink_entries[i]), bink_entries[i]);
+    }
+#endif
     extern void touch_setup_guest(void);
     touch_setup_guest();
     for (int i = 0; i < ndll; i++) {

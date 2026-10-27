@@ -68,6 +68,8 @@ size_t guest_vformat(char *out, size_t cap, const char *fmt, uint32_t argp);
 
 /* Call a guest function from the host with stdcall/cdecl args already chosen. */
 uint32_t rt_invoke(CPU *c, uint32_t fn, int nargs, const uint32_t *args);
+/* Name a guest entry point; its first call logs its arguments and result. */
+void rt_trace_point(uint32_t addr, const char *name);
 /* kernel32: shared by CreateThread and msvcr80!_beginthreadex */
 uint32_t rt_thread_create(uint32_t start, uint32_t param, uint32_t flags, uint32_t *tid_out);
 
