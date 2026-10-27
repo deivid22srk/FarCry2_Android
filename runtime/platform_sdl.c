@@ -216,8 +216,29 @@ void platform_pump_events(void) {
             key_event(e.key.keysym.scancode, e.type == SDL_KEYDOWN);
         if (e.type == SDL_WINDOWEVENT) {
             extern void user32_focus(int);
-            if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) user32_focus(1);
-            else if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST) user32_focus(0);
+            if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
+#ifdef __ANDROID__
+                /* The phone delivers FOCUS_LOST/GAINED in bursts (system UI,
+                 * cutouts, launcher overlays) even while the app is fully in
+                 * the foreground. Every FOCUS_LOST posts WM_ACTIVATEAPP(0),
+                 * the engine stops presenting and idles in PeekMessageA, and
+                 * when one burst ends on a LOST the game never comes back --
+                 * the first phone log froze that way at frame 1506 with the
+                 * watchdog screaming "no new frames". The app's lifecycle is
+                 * the only trustworthy signal on Android, so focus events no
+                 * longer touch the game's activation (the two APP_ events
+                 * below still pause/resume it for a real backgrounding). */
+                static int logged;
+                if (!logged++ || logged % 100 == 0)
+                    LOG("android: window focus event %d ignored (%d so far)", e.window.event, logged);
+#else
+                user32_focus(1);
+#endif
+            } else if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+#ifndef __ANDROID__
+                user32_focus(0);
+#endif
+            }
         }
         /* Android pause/resume: SDL reports these even when the window never
          * sees a focus event (the app is paused, so nothing presents). */

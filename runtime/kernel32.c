@@ -751,7 +751,11 @@ SHIM(CreateFileA) {
     }
     { const char *x = strrchr(host, '.');
       if (x && (!strcasecmp(x, ".esm") || !strcasecmp(x, ".esp") || !strcasecmp(x, ".bsa")))
-          LOG("CreateFileA %s -> fd %d", host, fd); }
+          LOG("CreateFileA %s -> fd %d", host, fd);
+      /* Movie files: the game's videos are Bink, and whether they are opened
+       * at all is the first thing a broken-playback log needs to show. */
+      if (x && !strcasecmp(x, ".bik"))
+          LOG("CreateFileA %s -> fd %d%s", host, fd, fd < 0 ? " (missing?)" : ""); }
     if (fl & (O_WRONLY | O_RDWR))
         LOG("CreateFileA %s (write, disposition %u) -> fd %d%s%s", host, disp, fd,
             fd < 0 ? " " : "", fd < 0 ? strerror(errno) : "");

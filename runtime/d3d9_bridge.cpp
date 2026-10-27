@@ -225,13 +225,26 @@ void B_IDirect3D9_GetAdapterIdentifier(CPU *c) {
 // and writes the chosen one to SkyrimPrefs.ini (the game only accepts a size
 // that is in this list). The chosen mode becomes the back buffer, which dxvk
 // scales up to the window.
+//
+// Far Cry 2 enumerates this list and *picks* one of the smaller modes: on the
+// phone (window 2285x1080) it chose the 648-height mode (1370x648), sized its
+// window for it and created the device with it. Overriding the back buffer to
+// the window's size then left the game laying out and clearing for 1370x648
+// inside a 2285x1080 frame: the picture sat in a box in the corner (exactly
+// what the first phone screenshots show). A phone has exactly one real
+// display size, so the FC2 build reports a single mode -- the window's own --
+// and the game's "pick the closest mode" logic can only land on it.
 static const uint32_t k_mode_heights[] = {1080, 900, 720, 648, 576, 540, 480, 432, 360, 288, 270, 216, 180, 144, 108};
 static uint32_t mode_count(int *ww, int *wh) {
     *ww = 1280; *wh = 720;
     SDL_GetWindowSize((SDL_Window *)platform_window(), ww, wh);
+#ifdef GAME_FC2
+    return 1;  /* the window size itself is the only mode */
+#else
     uint32_t n = 1;  // the window size itself
     for (uint32_t h : k_mode_heights) if ((int)h < *wh) n++;
     return n;
+#endif
 }
 extern "C" void bridge_scaled_mode(uint32_t i, uint32_t *w, uint32_t *h) {
     int ww, wh;
@@ -252,7 +265,18 @@ extern "C" void bridge_scaled_mode(uint32_t i, uint32_t *w, uint32_t *h) {
  * came out stretched ~1.6x horizontally. Replace any size that is not at the
  * window's aspect with the window's own size, the first entry of the list the
  * game's "Resolution Scale" menu offers, so the blit is 1:1. An in-game
- * Resolution Scale choice is already at the window's aspect and is kept. */
+ * Resolution Scale choice is already at the window's aspect and is kept.
+ *
+ * Far Cry 2 keeps its own resolution in its profile (Video_Width/Height in
+ * GamerProfiles.cfg), so an override cannot fix it either: the override only
+ * changes the back buffer, while the engine goes on laying out, clearing and
+ * drawing for the size it asked for -- the frame ends up in a box of the
+ * game's size inside the bigger back buffer (the first phone screenshots).
+ * FC2 therefore keeps the guest's requested size and lets dxvk scale it to
+ * the window, which is plain D3D9 windowed-present behaviour and always fills
+ * the screen. mode_count() above offers only the window size, so a game that
+ * picks a mode from the list lands on the native resolution anyway; a size
+ * read back from the profile is honoured and shown stretched, never boxed. */
 
 /* ---- USM display sync ----------------------------------------------------
  * Fixing the present parameters alone still renders the frame into a 4:3 box
@@ -397,6 +421,17 @@ static void pp_fix_size(D3DPRESENT_PARAMETERS *pp) {
     long long off = (long long)bw * wh - (long long)bh * ww;
     if (off < 0) off = -off;
     if (off == 0) return;                                    /* exactly the window's aspect */
+#ifdef GAME_FC2
+    /* Keep the size the engine asked for and let dxvk stretch it to the
+     * window. Overriding used to leave the engine laying out for its own size
+     * inside a bigger back buffer (a boxed frame in the corner); the stretch
+     * is what D3D9's windowed Present does on Windows and always fills the
+     * screen. mode_count() offers only the window size, so games that pick a
+     * mode land here with nothing to stretch at all. */
+    LOG("back buffer %ux%u is not the window's aspect: keeping the game's size, dxvk scales it to %ux%u",
+        bw, bh, (unsigned)ww, (unsigned)wh);
+    return;
+#endif
     LOG("back buffer %ux%u is not the window's aspect: using %ux%u (mode 0) so dxvk does not stretch the frame",
         bw, bh, (unsigned)ww, (unsigned)wh);
     pp->BackBufferWidth = (uint32_t)ww;

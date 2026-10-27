@@ -563,6 +563,12 @@ int main(int argc, char **argv) {
     for (; g_dll_modules[ndll]; ndll++)
         dll_entries[ndll] = load_pe(g_dll_modules[ndll], g_dll_bases[ndll], g_dll_modules[ndll]);
     load_pe(GAME_EXE, 0, GAME_EXE);
+#if defined(GAME_FC2)
+    /* Wrap the lifted binkw32 exports with logging before the second import
+     * pass binds the game's Bink calls, so the phone log shows what the
+     * movie system actually does (BinkOpen paths, decode results). */
+    { extern void binkdiag_install(void); binkdiag_install(); }
+#endif
     /* Second import pass. Imports are bound as each module is mapped, so an
      * import from a module that has not been mapped yet (Dunia.dll imports
      * binkw32.dll, which loads after it) bound to the abort stub and aborted

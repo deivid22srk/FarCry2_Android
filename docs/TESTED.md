@@ -72,6 +72,26 @@ accepts it.
 | [40398348378](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40398348378) | **success** | full APK after the wide-string fixes; `FarCry2.apk` 45,545,214 bytes, published as the private release `apk-6-20261026-2051` — **this is the build the user tested on the phone** (the log's `libmain.so` BuildId matches its `lib/arm64-v8a/libmain.so` exactly) |
 | [40403855986](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40403855986) | **success** | full APK carrying the three fixes for the phone crash (`runtime/u16.h`, the `data_win32` mapping, the D3DX9 `__stdcall` change); `recompiled files: 692`, `FarCry2.apk` 45,544,734 bytes, sha256 `0a9b719a...af9c`, published as the private release `apk-7-20261026-2135` |
 
+## Phone run of 2026-10-27 (user's `port/log.txt` + screenshots, apk-7)
+
+The user's own log and three screenshots show the game past the UI init that
+`apk-6` died in: the Ubisoft logos, the "Press any key" title screen, and — in
+the later screenshot — the main menu. That is the furthest the port has ever
+run. The log and the screenshots also pin down three defects, all addressed in
+`runtime/` the same day:
+
+| Evidence | Reading | Change |
+|---|---|---|
+| The title screen's game area is a solid green box (1370x648 inside 2400x1080), and the later screenshot shows the menu in the same box | The game picked the 648-height mode the bridge's own `bridge_scaled_mode` list offers (648 at the window's aspect = 1370x648), sized its window for it and created the device with it. `pp_fix_size` then overrode the back buffer to the window's 2285x1080 — but the engine went on laying out and clearing for 1370x648, so the frame sat boxed in the corner of a bigger back buffer. (The `CreateTexture ... -> 00000000` lines in the same log are **successes**: `00000000` is `D3D_OK`, the log prints the HRESULT.) | `mode_count()` reports a single mode — the window's own size — for `GAME_FC2`, so the game's pick can only land on the native resolution; and `pp_fix_size` no longer overrides the game's request for FC2: dxvk scales whatever the engine asks for to the window (plain D3D9 windowed Present), which fills the screen instead of boxing it |
+| `window deactivated` / `window activated` every ~300 frames; the run ends with a `window deactivated` that is never followed by an activation, `watchdog 30s: frames 1506`, thread 0 idling in `USER32!PeekMessageA` with 10,392,867 calls | The phone delivers `SDL_WINDOWEVENT_FOCUS_LOST/GAINED` in bursts while the app is in the foreground. Each FOCUS_LOST posts `WM_ACTIVATEAPP(0)`, the engine stops presenting and idles in its message pump, and when one burst ends on a LOST it never resumes | On `__ANDROID__`, focus events no longer touch the game's activation; only `SDL_APP_WILLENTERBACKGROUND`/`DIDENTERFOREGROUND` (a real backgrounding) pause/resume it |
+| Intro shows only the "Ubisoft presents …" text, title background is green; the log never mentions Bink | The title/intro picture is a Bink video; a surface whose YUV planes are never filled samples as green. Nothing logged what the movie system does | `runtime/binkdiag.c` (new) wraps all 16 `_Bink*@N` entry points with rate-limited logging (`BinkOpen` logs the movie path and the returned struct's w/h/frames); `rt_register_data` overrides in place so the wrappers replace the lifted exports for the second import pass; `CreateFileA` logs `.bik` opens at log level 1 |
+
+What the next phone log should therefore show: no more `window deactivated`
+churn mid-title, a back buffer equal to the window's size (or, if the engine
+sticks to a profile-stored size, a stretched full-screen frame instead of a
+boxed one), and — for the videos — either working `BinkOpen`/`BinkDoFrame`
+lines or the precise point where the movie system gives up.
+
 ## Implemented but not tested
 
 | What | Why not |

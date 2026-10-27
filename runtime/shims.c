@@ -70,6 +70,15 @@ static void key_build(char *out, const char *want, const char *name) {
 void rt_register_data(const char *dll, const char *name, uint32_t addr) {
     char want[64];
     dll_base(dll, want, sizeof want);
+    char key[IMP_KEY];
+    key_build(key, want, name);
+    /* Re-registering a known key overrides it in place. load_pe() registers
+     * every export of a recompiled module once; the one legitimate second
+     * call is binkdiag's, which re-points a binkw32 export at a logging
+     * wrapper after the module is loaded (rt_import() reads g_addrs first,
+     * so the update is what the next import pass binds). */
+    for (int i = 0; i < g_naddrs; i++)
+        if (!strcasecmp(g_addrs[i].key, key)) { g_addrs[i].addr = addr; return; }
     if (g_naddrs >= MAX_ADDRS) rt_fatal("too many data imports");
     key_build(g_addrs[g_naddrs].key, want, name);
     g_addrs[g_naddrs++].addr = addr;
