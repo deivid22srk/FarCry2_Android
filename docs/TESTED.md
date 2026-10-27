@@ -146,3 +146,31 @@ and no device run has used this branch yet.
 
 Not addressed here: the Bink videos, SEH/C++ exceptions, and the `watchdog ... (no new
 frames)` stall (which in the 13:01 log recovers — `frame 2400`/`2700`/`3000` follow it).
+
+## The nested-lock regression in the D3DX paths (apk-9 log, 2026-10-27)
+
+`port/3log.txt` (13:58, the run behind `apk-9-20261027-1352`) confirms the
+back-buffer fix — `touch: back buffer 1370x648, window 2285x1080, aspect 2.1157`,
+`Presenter: Buffer size: 2285x1080` — and reaches `frame 3300`. It also shows
+`D3DX: LockRect failed` **exactly 234 times**: 6 faces x (8+8+8+8+7) mip levels of
+the five DXT cube maps, i.e. one failure per subresource the BC emulation had just
+started creating.
+
+Cause: every DDS `LockRect` site in `runtime/d3dx9_host.cpp` locked the surface
+itself and then, in the non-raw branch, called `blit_argb()`, which locks the same
+surface again. `D3D9DeviceEx::LockImage` refuses the nested lock (*"Don't allow
+multiple lockings"*, `D3DERR_INVALIDCALL`), so the inner lock failed and the DDS
+bytes never reached the texture. Before the BC-emulation change that branch was not
+taken for DXT, so the bug was latent; afterwards it silently blanked every emulated
+DDS and cube map. The raw-copy and `blit_argb()` cases are now exclusive in both the
+2-D and cube paths, and the failure log prints the HRESULT and the rectangle.
+
+`runtime/binkdiag.c` (from the title-render branch) also had a format bug: its
+per-entry argument macros expanded to several printf arguments, so `(%s)` consumed
+the format string as the value and the actual result and call count were left
+unused — the wrapper logged pointers where the result should be. Each entry point
+now formats its arguments into a buffer first, so the log prints
+`bink: BinkOpen(name="...", flags=...) -> <handle> (call N)` as intended.
+
+Both are **written and syntax-checked only**; the APK still comes from Actions and
+no phone run has used them yet.

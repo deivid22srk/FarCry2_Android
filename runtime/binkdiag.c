@@ -29,17 +29,26 @@ static int bink_log_gate(uint32_t *n) {
 }
 
 /* One wrapper per entry point. It snapshots the stdcall args, calls the
- * lifted original through rt_invoke, logs, and returns. */
-#define BINK_WRAPPER(cname, nargs, rare, args_log)                             \
+ * lifted original through rt_invoke, logs, and returns.
+ *
+ * The argument description is a formatter, not an extra printf argument list.
+ * A list expands into several arguments, and the "%s" below would then take
+ * its *format string* as the value and leave the real result and call count
+ * unconsumed -- the first version of this file did that and printed the raw
+ * pointers in place of the result. */
+#define BINK_WRAPPER(cname, nargs, rare, args_fmt)                             \
     static struct { uint32_t real; uint32_t calls; } g_bk_##cname;             \
     static void shim_bk_##cname(CPU *c) {                                      \
         uint32_t a[nargs ? nargs : 1];                                         \
         for (int i = 0; i < nargs; i++) a[i] = ARG(i);                         \
         if (g_bk_##cname.real && g_bk_##cname.real < GUEST_THUNK_BASE) {       \
             uint32_t r = rt_invoke(c, g_bk_##cname.real, nargs, a);            \
-            if (rare || bink_log_gate(&g_bk_##cname.calls))                    \
-                LOG("bink: " #cname "(%s) -> %08x (call %u)", args_log, r,     \
+            if (rare || bink_log_gate(&g_bk_##cname.calls)) {                  \
+                char abuf[192];                                                \
+                args_fmt(abuf, sizeof abuf);                                   \
+                LOG("bink: " #cname "(%s) -> %08x (call %u)", abuf, r,         \
                     g_bk_##cname.calls);                                       \
+            }                                                                  \
             RET(r, nargs);                                                     \
         }                                                                      \
         LOG("bink: " #cname " has no lifted original; failing");               \
@@ -48,15 +57,18 @@ static int bink_log_gate(uint32_t *n) {
 
 /* arg formatters (GSTR on a guest pointer is safe: whole sections are copied
  * into guest memory and NUL-padded) */
-#define A0_NAME  "name=\"%s\" flags=%x", GSTR(a[0]) ? GSTR(a[0]) : "?", a[1]
-#define A1_PTR   "p=%08x", a[0]
-#define A2_PTRS  "p=%08x, %08x", a[0], a[1]
-#define A3_PTRS  "p=%08x, %08x, %08x", a[0], a[1], a[2]
-#define A_NONE   ""
+#define A0_NAME(buf, cap) snprintf(buf, cap, "name=\"%s\" flags=%x",           \
+                 GSTR(a[0]) ? GSTR(a[0]) : "?", a[1])
+#define A1_PTR(buf, cap)  snprintf(buf, cap, "p=%08x", a[0])
+#define A2_PTRS(buf, cap) snprintf(buf, cap, "p=%08x, %08x", a[0], a[1])
+#define A3_PTRS(buf, cap) snprintf(buf, cap, "p=%08x, %08x, %08x", a[0], a[1], a[2])
+#define A_NONE(buf, cap)  snprintf(buf, cap, "%s", "")
 /* The BINK struct starts Width, Height, FrameCount (bink_test reads them
  * there); log them so a dead decoder (all zeros) is visible in the log. */
-#define A_BINK   "bink=%08x [w=%u h=%u frames=%u]", a[0], a[0] >= 0x10000 ? M32(a[0]) : 0, \
-                 a[0] >= 0x10000 ? M32(a[0] + 4) : 0, a[0] >= 0x10000 ? M32(a[0] + 8) : 0
+#define A_BINK(buf, cap)  snprintf(buf, cap, "bink=%08x [w=%u h=%u frames=%u]", \
+                 a[0], a[0] >= 0x10000 ? M32(a[0]) : 0u,                       \
+                 a[0] >= 0x10000 ? M32(a[0] + 4) : 0u,                         \
+                 a[0] >= 0x10000 ? M32(a[0] + 8) : 0u)
 
 /* The 16 binkw32 entry points Dunia.dll imports (from the first phone log).
  * The @N suffixes are the stdcall arg byte counts, matching nargs. */
