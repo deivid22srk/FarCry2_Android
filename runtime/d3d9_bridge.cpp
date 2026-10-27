@@ -804,11 +804,33 @@ bool shadow_end(void *obj, uint32_t sub, uint32_t caller) {
                 if (v) nz++;
                 sum += v;
             }
+            /* The engine keeps two sets of plane textures and publishes both
+             * through the BINKFRAMEBUFFERS entries, but Bink only decodes into
+             * the set whose index equals fb->CurrentFrame. The engine then
+             * unlocks the *other* set, so what reaches the GPU is a buffer
+             * Bink never touched: all zero, which the YUV shader turns into a
+             * flat green (or black, once chroma reads 0x80) screen. The planes
+             * Bink did write are right there in the same struct, so publish
+             * the current frame's plane into the buffer being unlocked. The
+             * entry index also names the plane (0=Y, 1=U, 2=V), which is how
+             * the two 256000-byte chroma locks are told apart. */
+            int filled = 0;
+            if (fb && match >= 0 && cur < 2) {
+                int plane = match & 3;
+                uint32_t e = fb + 0x18 + 12 * (4 * cur + plane);
+                uint32_t src = M32(e + 4), pitch = M32(e + 8);
+                uint32_t h = (plane == 0) ? M32(fb + 0x08) : M32(fb + 0x10);
+                if (src >= 0x1000 && src != s.guest &&
+                    (uint64_t)pitch * h == (uint64_t)s.size) {
+                    memcpy(MEM + s.guest, MEM + src, s.size);
+                    filled = 1;
+                }
+            }
             if (n < 6 || n % 300 == 0)
                 LOG("video plane unlock #%d: %u bytes, nonzero %u sum %u, first %02x %02x %02x %02x, "
-                    "guest %08x, bink frame %u plane %08x, fb entry %d, caller %08x",
+                    "guest %08x, bink frame %u plane %08x, fb entry %d, caller %08x, filled %d",
                     n, (unsigned)s.size, nz, sum, MEM[s.guest], MEM[s.guest + 1],
-                    MEM[s.guest + 2], MEM[s.guest + 3], s.guest, cur, curplane, match, caller);
+                    MEM[s.guest + 2], MEM[s.guest + 3], s.guest, cur, curplane, match, caller, filled);
             n++;
         }
         memcpy(s.host, MEM + s.guest, s.size);

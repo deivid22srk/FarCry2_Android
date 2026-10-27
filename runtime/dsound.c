@@ -245,6 +245,7 @@ SHIM(dsb_Lock) {
 }
 SHIM(dsb_Play) {
     DSBuf *b = B;
+    { static int n; if (n++ < 4) LOG("dsound: Play(%u bytes, flags %x)", b->d->size, ARG(3)); }
     SDL_LockMutex(g_mix_lock);
     b->playing = 1;
     b->looping = (ARG(3) & 1) != 0;
@@ -457,12 +458,21 @@ SHIM(ds_CreateSoundBuffer) {
         memset(MEM + b->d->data, b->bits == 8 ? 0x80 : 0, b->d->size);
     }
     TRACE("dsound: buffer %u bytes %dch %dHz %dbit flags %x", b->d->size, b->channels, b->rate, b->bits, b->flags);
+    /* The mixer census reports zero buffers on device, so log every creation:
+     * either the game never asks for one (and the audio path bails somewhere
+     * above us) or it asks with a format we then have to honour. */
+    { static int n;
+      if (n < 12)
+          LOG("dsound: CreateSoundBuffer #%d: %u bytes %dch %dHz %dbit flags %x primary %d",
+              n, b->d->size, b->channels, b->rate, b->bits, b->flags, b->primary);
+      n++; }
     M32(ARG(2)) = buf_register(b);
     RET(0, 4);
 }
 SHIM(ds_GetCaps) {
     uint32_t p = ARG(1);
     uint32_t sz = M32(p);
+    { static int n; if (n++ < 2) LOG("dsound: GetCaps(size %u)", sz); }
     memset(MEM + p + 4, 0, sz - 4);
     M32(p + 4) = 0x00000F5F; /* continuous rate, 8/16 bit, mono/stereo, secondary */
     M32(p + 8) = 100;
@@ -481,11 +491,28 @@ SHIM(ds_DuplicateSoundBuffer) {
     M32(ARG(2)) = buf_register(b);
     RET(0, 3);
 }
-SHIM(ds_SetCooperativeLevel) { RET(0, 3); }
-SHIM(ds_Compact) { RET(0, 1); }
-SHIM(ds_GetSpeakerConfig) { M32(ARG(1)) = 4; RET(0, 2); } /* DSSPEAKER_STEREO */
-SHIM(ds_SetSpeakerConfig) { RET(0, 2); }
-SHIM(ds_Initialize) { RET(0, 2); }
+SHIM(ds_SetCooperativeLevel) {
+    /* COM: ARG(0)=this, ARG(1)=hwnd, ARG(2)=level */
+    { static int n; if (n++ < 4) LOG("dsound: SetCooperativeLevel(hwnd %08x, level %u)", ARG(1), ARG(2)); }
+    RET(0, 3);
+}
+SHIM(ds_Compact) {
+    { static int n; if (n++ < 2) LOG("dsound: Compact"); }
+    RET(0, 1);
+}
+SHIM(ds_GetSpeakerConfig) {
+    M32(ARG(1)) = 4; /* DSSPEAKER_STEREO */
+    { static int n; if (n++ < 2) LOG("dsound: GetSpeakerConfig -> 4"); }
+    RET(0, 2);
+}
+SHIM(ds_SetSpeakerConfig) {
+    { static int n; if (n++ < 2) LOG("dsound: SetSpeakerConfig(%08x)", ARG(1)); }
+    RET(0, 2);
+}
+SHIM(ds_Initialize) {
+    { static int n; if (n++ < 2) LOG("dsound: Initialize"); }
+    RET(0, 2);
+}
 SHIM(ds_VerifyCertification) { M32(ARG(1)) = 0; RET(0, 2); }
 
 static const ShimFn k_ds_fns[] = {
@@ -496,6 +523,7 @@ static const ShimFn k_ds_fns[] = {
 
 SHIM(DirectSoundCreate8) {
     static int init;
+    LOG("dsound: DirectSoundCreate8(guid %08x, out %08x)", ARG(0), ARG(1));
     if (!init) {
         hcom_class_init(&k_ds8, "IDirectSound8", k_ds_fns, sizeof k_ds_fns / sizeof k_ds_fns[0]);
         hcom_class_init(&k_dsb, "IDirectSoundBuffer8", k_dsb_fns, sizeof k_dsb_fns / sizeof k_dsb_fns[0]);
