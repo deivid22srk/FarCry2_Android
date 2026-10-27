@@ -415,19 +415,28 @@ static void pp_fix_size(D3DPRESENT_PARAMETERS *pp) {
     user32_set_screen(ww, wh);
     uint32_t bw = pp->BackBufferWidth, bh = pp->BackBufferHeight;
     if (!bw || !bh) return;
-    /* Same aspect when bw/bh == ww/wh, i.e. bw*wh == bh*ww. The old test
-     * compared that area-sized cross product against wh (a height), so a
-     * back buffer a few pixels off the window's aspect was not corrected. */
-    long long off = (long long)bw * wh - (long long)bh * ww;
+    /* Same aspect when bw/bh == ww/wh, i.e. bw*wh == bh*ww. The game rounds
+     * its own size to whole pixels, so a back buffer merely a fraction of a
+     * percent off the window's aspect is still that aspect: 1370x648 against
+     * the window's 2285x1080 is 0.07 % apart. The old test demanded an exact
+     * cross product, so the harmless rounding counted as a mismatch and the
+     * back buffer was forced to the window's size while the game kept
+     * rendering its own 1370x648 viewport -- the frame in the corner with the
+     * rest of the screen black. Accept anything within 1 % and let dxvk scale
+     * it the fraction of a pixel it needs. */
+    long long ref = (long long)bw * wh;
+    long long off = ref - (long long)bh * ww;
     if (off < 0) off = -off;
-    if (off == 0) return;                                    /* exactly the window's aspect */
+    if (off * 100 <= ref) return;                            /* the window's aspect (to rounding) */
 #ifdef GAME_FC2
     /* Keep the size the engine asked for and let dxvk stretch it to the
      * window. Overriding used to leave the engine laying out for its own size
      * inside a bigger back buffer (a boxed frame in the corner); the stretch
      * is what D3D9's windowed Present does on Windows and always fills the
      * screen. mode_count() offers only the window size, so games that pick a
-     * mode land here with nothing to stretch at all. */
+     * mode land here with nothing to stretch at all; a profile-stored
+     * resolution scale (the game's own "Resolution Scale" list, refilled by
+     * runtime/touch.cpp) is honoured and shown stretched, never boxed. */
     LOG("back buffer %ux%u is not the window's aspect: keeping the game's size, dxvk scales it to %ux%u",
         bw, bh, (unsigned)ww, (unsigned)wh);
     return;
