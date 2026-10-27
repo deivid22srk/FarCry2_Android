@@ -36,6 +36,12 @@ typedef struct {
 static HComClass k_ds8, k_dsb, k_ds3dl, k_ds3db;
 static SDL_mutex *g_mix_lock;
 static DSBuf *g_bufs[MAX_BUFFERS];
+static int g_ds_created, g_ds_destroyed;
+static int buf_live(void) {
+    int n = 0;
+    for (int k = 0; k < MAX_BUFFERS; k++) if (g_bufs[k]) n++;
+    return n;
+}
 static SDL_AudioDeviceID g_dev;
 static float g_master = 1.0f;
 
@@ -102,7 +108,8 @@ static void mix_cb(void *ud, Uint8 *stream, int len) {
             else if (b->playing) play++;
         }
         SDL_UnlockMutex(g_mix_lock);
-        LOG("audio: %d buffers (%d primary), %d playing", live, prim, play);
+        LOG("audio: %d buffers (%d primary), %d playing, created %d destroyed %d",
+            live, prim, play, g_ds_created, g_ds_destroyed);
     }
 }
 
@@ -132,6 +139,12 @@ static uint32_t buf_register(DSBuf *b) {
 }
 
 static void buf_destroy(DSBuf *b) {
+    g_ds_destroyed++;
+    { static int n;
+      if (n < 24)
+          LOG("dsound: destroy buffer %u bytes, primary %d, playing %d (created %d destroyed %d)",
+              b->d ? b->d->size : 0, b->primary, b->playing, g_ds_created, g_ds_destroyed);
+      n++; }
     SDL_LockMutex(g_mix_lock);
     for (int k = 0; k < MAX_BUFFERS; k++)
         if (g_bufs[k] == b) g_bufs[k] = NULL;
@@ -226,6 +239,7 @@ SHIM(dsb_Initialize) { RET(0x88780082u, 3); } /* DSERR_ALREADYINITIALIZED */
 SHIM(dsb_Lock) {
     /* (this, offset, bytes, p1, n1, p2, n2, flags) */
     DSBuf *b = B;
+    { static int n; if (n++ < 8) LOG("dsound: Lock #%d off %u bytes %u flags %x", n, ARG(1), ARG(2), ARG(7)); }
     uint32_t size = b->d->size;
     uint32_t off = ARG(1), n = ARG(2), fl = ARG(7);
     if (!size) { RET(0x88780032u, 8); }
@@ -245,7 +259,7 @@ SHIM(dsb_Lock) {
 }
 SHIM(dsb_Play) {
     DSBuf *b = B;
-    { static int n; if (n++ < 4) LOG("dsound: Play(%u bytes, flags %x)", b->d->size, ARG(3)); }
+    { static int n; if (n++ < 24) LOG("dsound: Play(%u bytes, flags %x, %dch %dHz %dbit)", b->d->size, ARG(3), b->channels, b->rate, b->bits); }
     SDL_LockMutex(g_mix_lock);
     b->playing = 1;
     b->looping = (ARG(3) & 1) != 0;
@@ -466,7 +480,9 @@ SHIM(ds_CreateSoundBuffer) {
           LOG("dsound: CreateSoundBuffer #%d: %u bytes %dch %dHz %dbit flags %x primary %d",
               n, b->d->size, b->channels, b->rate, b->bits, b->flags, b->primary);
       n++; }
+    g_ds_created++;
     M32(ARG(2)) = buf_register(b);
+    LOG("dsound: buffer registered, live %d", buf_live());
     RET(0, 4);
 }
 SHIM(ds_GetCaps) {
