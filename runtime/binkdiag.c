@@ -218,9 +218,37 @@ static void shim_bk_BinkDoFrame(CPU *c) {
  * unlock is one of the planes Bink was handed for the current frame. */
 uint32_t binkdiag_fb(void) { return g_bk_fb; }
 
+/* Desktop debugging: LB_BINK_FF=1 fast-forwards every video. ShouldSkip
+ * answers 1 (the game then calls BinkNextFrame instead of BinkDoFrame, so no
+ * plane is decoded) and BinkWait answers 0 (the loop never paces itself), so
+ * the timeline burns through at loop speed. The displayed video becomes a
+ * still frame; only reaching the world faster matters here. */
+static int bink_ff(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("LB_BINK_FF"); v = e && *e && *e != '0'; }
+    return v;
+}
+
+static void shim_ff_BinkShouldSkip(CPU *c) {
+    if (bink_ff()) { RET(1, 1); }
+    shim_bk_BinkShouldSkip(c);
+}
+
+static void shim_ff_BinkWait(CPU *c) {
+    if (bink_ff()) {
+        /* Yield instead of hot-spinning: the loop still burns through the
+         * timeline at ~500 frames/s (far above any video rate), but the
+         * loading screen's looping video stops starving the streamer. */
+        struct timespec ts = {0, 2 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+        RET(0, 1);
+    }
+    shim_bk_BinkWait(c);
+}
+
 static const struct { const char *name; ShimFn fn; } k_wrapped[] = {
     { "_BinkSetSoundSystem@8",       shim_bk_BinkSetSoundSystem },
-    { "_BinkShouldSkip@4",           shim_bk_BinkShouldSkip },
+    { "_BinkShouldSkip@4",           shim_ff_BinkShouldSkip },
     { "_BinkSetMemory@8",            shim_bk_BinkSetMemory },
     { "_BinkPause@8",                shim_bk_BinkPause },
     { "_BinkNextFrame@4",            shim_bk_BinkNextFrame },
@@ -232,7 +260,7 @@ static const struct { const char *name; ShimFn fn; } k_wrapped[] = {
     { "_BinkLogoAddress@0",          shim_bk_BinkLogoAddress },
     { "_BinkDoFrame@4",              shim_bk_BinkDoFrame },
     { "_BinkOpenDirectSound@4",      shim_bk_BinkOpenDirectSound },
-    { "_BinkWait@4",                 shim_bk_BinkWait },
+    { "_BinkWait@4",                 shim_ff_BinkWait },
     { "_BinkSetVolume@12",           shim_bk_BinkSetVolume },
     { "_BinkSetSoundOnOff@8",        shim_bk_BinkSetSoundOnOff },
 };

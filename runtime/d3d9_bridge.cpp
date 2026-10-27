@@ -598,6 +598,35 @@ static void bisect_present(void) {
 static volatile uint32_t g_frame_draws, g_last_frame_draws;
 extern "C" void d3d9_count_draw(void) { __atomic_add_fetch(&g_frame_draws, 1, __ATOMIC_RELAXED); }
 extern "C" uint32_t d3d9_last_frame_draws(void) { return __atomic_load_n(&g_last_frame_draws, __ATOMIC_RELAXED); }
+
+/* Per-frame render summary, printed from Present. The story-mode black screen
+ * shows nothing while the engine keeps drawing and the touch overlay stays
+ * visible, so the question is where the scene went: which render target the
+ * world drew into, whether a StretchRect (or a final textured quad) carried
+ * it to the back buffer, and how much was drawn. One compact line per frame
+ * answers all of that in the phone's log without a full call trace. */
+static uint32_t g_pf_rt[2], g_pf_ds, g_pf_stretch, g_pf_st_src, g_pf_st_dst,
+                g_pf_clears, g_pf_clear_color, g_pf_tex0, g_pf_setrt_pc;
+extern "C" void pf_setrt(uint32_t idx, uint32_t surf) {
+    if (idx == 0 && surf != g_pf_rt[0]) g_pf_setrt_pc++;
+    if (idx < 2) g_pf_rt[idx] = surf;
+}
+extern "C" void pf_setds(uint32_t surf) { g_pf_ds = surf; }
+extern "C" void pf_stretch(uint32_t src, uint32_t dst) {
+    g_pf_stretch++; g_pf_st_src = src; g_pf_st_dst = dst;
+}
+extern "C" void pf_clear(uint32_t color) { g_pf_clears++; g_pf_clear_color = color; }
+extern "C" void pf_settex(uint32_t stage, uint32_t tex) { if (!stage) g_pf_tex0 = tex; }
+static void pf_summary(void) {
+    static uint32_t n;
+    /* every 15th frame, plus any frame that switched render targets or used
+     * StretchRect: those are the transitions the black screen lives in */
+    if ((++n % 15) == 0 || g_pf_setrt_pc || g_pf_stretch)
+        LOG("pf %u: rt0=%08x rt1=%08x ds=%08x draws=%u stretch=%u [%08x->%08x] clr=%u(%08x) tex0=%08x",
+            n, g_pf_rt[0], g_pf_rt[1], g_pf_ds, (unsigned)g_last_frame_draws,
+            g_pf_stretch, g_pf_st_src, g_pf_st_dst, g_pf_clears, g_pf_clear_color, g_pf_tex0);
+    g_pf_stretch = 0; g_pf_setrt_pc = 0;
+}
 static void d3d9_frame_begin(void) {
     __atomic_store_n(&g_last_frame_draws, __atomic_load_n(&g_frame_draws, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
     __atomic_store_n(&g_frame_draws, 0, __ATOMIC_RELAXED);
@@ -614,6 +643,9 @@ void B_IDirect3DDevice9_Present(CPU *c) {
     g_frame++;
     g_d3d_trace = g_frame >= g_trace_from && g_frame <= g_trace_to;
     if (g_d3d_trace) fprintf(stderr, "D3D %d Present\n", g_frame);
+    if ((g_frame % 60) == 0)
+        LOG("present %d: draws=%u", g_frame, (unsigned)g_frame_draws);
+    pf_summary();
 #ifdef GAME_USM
     usm_display::hold_aspect();  /* camera projection at the window's aspect */
 #endif
@@ -813,7 +845,7 @@ bool shadow_end(void *obj, uint32_t sub, uint32_t caller) {
              * colour while the videos played. With the video-plane locks
              * persisted (shadow_begin), every plane keeps its own chain and
              * the engine's copy has a complete frame to work from. */
-            if (n < 6 || n % 300 == 0)
+            if (n < 8 || n % 100 == 0)
                 LOG("video plane unlock #%d: %u bytes, nonzero %u sum %u, first %02x %02x %02x %02x, "
                     "guest %08x, bink frame %u plane %08x, fb entry %d, caller %08x",
                     n, (unsigned)s.size, nz, sum, MEM[s.guest], MEM[s.guest + 1],
