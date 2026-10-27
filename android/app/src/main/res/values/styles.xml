@@ -2,7 +2,16 @@
 <resources>
     <!-- Base application theme. -->
     <style name="AppTheme" parent="android:Theme.NoTitleBar.Fullscreen">
-        <!-- Customize your theme here. -->
+        <!-- Use the whole display, cutout included. With the default cutout
+             mode Android letterboxes a landscape game away from the camera
+             hole: on a 2400x1080 screen the window came up 2285x1080 and the
+             compositor filled the missing 115 px with black, which is the
+             vertical band down the left edge of every video scene. It also
+             forced the game to render 1920x1080 and be stretched to 2285,
+             which is where the jaggies came from. -->
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowNoTitle">true</item>
     </style>
 
     <!-- Launcher: same black as the screen's gradient, so there is no white
