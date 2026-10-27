@@ -23,13 +23,13 @@ and the shared runtime structure (which those projects also share).
 | Function discovery (`Dunia.dll`, 14.1 MB of code) | **Done**: 82,403 functions, 95.5 % coverage |
 | x86 → C lifting of all four modules | **Done**: 83,940 functions lifted, 261 rejected |
 | Runtime (`runtime/`, CRT/Win32/D3D9/DSound/input shims) | **Written** and executed: it boots the game on a host and reaches the render loop (see *First execution* below) |
-| Import resolution of the four modules | **Done**: every import resolves (`tools/import_coverage.py`); 0 unregistered imports, 0 abort stubs |
+| Import resolution of the four modules | **Done**: every import resolves (`tools/import_coverage.py`); 0 unregistered imports, 0 abort stubs. Bound in a second pass once every module is mapped, so `Dunia.dll`'s imports of the `binkw32.dll` that loads after it are bound to real code |
 | Host D3DX9 (`runtime/d3dx9_host.cpp`, 15 imports) | **Written**, compiles; exercised by the host run (texture creation observed) |
 | Android launcher + activity | **Written**, compiles in CI |
 | APK (app-only, stub tables) | **Built by GitHub Actions**, run [40338447334](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40338447334): `FarCry2-apk`, 2,106,960 bytes |
 | APK (full, with `gen/`) | **Built by GitHub Actions**: run [40377549175](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40377549175) → 45,540,586 bytes, run [40398348378](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40398348378) → 45,545,214 bytes, run [40403855986](https://github.com/deivid22srk/FarCry2_Android/actions/runs/40403855986) → 45,544,734 bytes, `arm64-v8a`, `libmain.so` 109,747,328 bytes. Published as **private** release assets in [`deivid22srk/FarCry2_gen`](https://github.com/deivid22srk/FarCry2_gen) (`apk-5-20261026-1836`, `apk-6-20261026-2051`, `apk-7-20261026-2135`), never here. `apk-7` contains the three fixes for the phone crash below, but has not been run on a phone yet |
 | Game on a phone | **Partially working**: the full APK installs on a real arm64 phone (Motorola Edge 30 Fusion, Android 14, Adreno 660) and the launcher opens and accepts the game folder; `farcry2.exe` → `Dunia!RunGame` boots. The user's `logcat` is from **`apk-6`** (its `libmain.so` BuildId matches that release exactly) and shows a `SIGSEGV` in the UI init, at a `NULL` entry of a lookup table only reachable because that build does not read the shipped `Data_Win32` data at all — see below |
-| Game on the host (desktop harness) | **Partially working**: boots to the engine's render loop, then dies in the UI init of the first screen (details below) |
+| Game on the host (desktop harness) | **Partially working**: boots through engine/UI init and the language-dependent data, and reaches **1,308 presented frames** (~43 fps) with 0 device resets; it then faults inside the host graphics stack (DXVK 1.9.2 → Mesa lavapipe `vkAllocateDescriptorSets`), not in guest code. Whether it reaches the main menu is **unverified** — see below |
 | SEH / C++ exceptions | **Not implemented** — top blocker, see below |
 
 The minimum acceptance target for this project is: APK installs, the launcher
@@ -51,16 +51,38 @@ What has been observed, running the user's own GOG copy:
   device and swap chain through DXVK, many `CreateTexture`, `Reset 1024x576`,
   then the `PeekMessageA` / `QueryPerformanceCounter` main loop.
 
-Where it stops (see `docs/TESTED.md` for the commands and the gdb evidence): the
-engine activates its first screen, `MAINMENU_INITIAL_RATING`, and dereferences
-`[screen+0x14]` — the root of that screen's UI-element tree — which is still
-`NULL`. The whole constructor chain of that screen object was disassembled from
-the real PE and compared byte-for-byte with the lifted C; the only instruction
-anywhere in the chain that touches the field **zeroes** it, and a byte-level scan
-of the entire `Dunia` `.text` plus a gdb watchpoint confirm no code in the
-process ever writes a non-`NULL` value. So whatever is supposed to build the
-screen's elements never runs. `f_10CA2220` then calls `f_10A86DD0` with the
-`NULL` and the fault lands at guest address `0x58`.
+Where it stops now (see `docs/TESTED.md` for the commands and the gdb evidence).
+The previous stop — the engine activating `MAINMENU_INITIAL_RATING` and
+dereferencing `[screen+0x14]`, its UI-element root, which was still `NULL` — was
+**not** a lifter problem. It was the engine's own language, and four defects in
+the runtime around it, all now found and fixed:
+
+* `GetPrivateProfileStringW` was `{ RET(0, 6); }`. Dunia's `f_10004690` reads the
+  engine language through it — `GetPrivateProfileStringW(L"FC2_INIT",
+  L"language", L"english", buf, 256, ...\FC2Init.ini)` at `0x10004818` — so the
+  language came back empty, and `f_1029B6E0` copied the stale inline byte `0x10`
+  of the result string as the name. Every localized path (`ui\localized\<lang>\…`)
+  was then unmatchable, the UI documents never registered, and the first page
+  request found nothing.
+* `D3DXGetImageInfoFromFileInMemory` read its arguments in the wrong order, so
+  the *size* (`0x1080`) went in as the source buffer — inside the `PROT_NONE`
+  guard page at the bottom of `MEM` — and the first UI texture load faulted.
+* Imports were bound per module as it was mapped, and `Dunia.dll` imports
+  `binkw32.dll` while being mapped *before* it, so those imports bound to the
+  abort stub and the first movie died on `_BinkSetMemory@8`.
+* `SetWindowPos` and `MoveWindow` were no-ops. The engine's display-mode switch
+  sizes its window and then verifies the client area through `GetClientRect`, so
+  with the helpers doing nothing it re-applied the same mode forever: **1,430
+  `IDirect3DDevice9::Reset` calls, all byte-identical `1024x576`**, each
+  rebuilding DXVK's swap chain, until the software Vulkan driver died.
+
+With those fixed the host run reaches **1,308 presented frames** (~43 fps) with
+**0 resets** and no fault in guest code. It then `SIGSEGV`s inside the host
+graphics stack — DXVK 1.9.2 `DxvkDescriptorPool::alloc` → Mesa lavapipe
+`vkAllocateDescriptorSets` — with no guest frame in the backtrace. That is a
+limitation of this headless harness (lavapipe 1.4.318 against DXVK 1.9.2), not
+something reproduced on a phone GPU. **Whether the game reaches the main menu is
+therefore still unverified.**
 
 The **phone** run stops earlier, and for a known reason: the `apk-6` build the
 user has predates three fixes that are in the tree now — guest wide strings must

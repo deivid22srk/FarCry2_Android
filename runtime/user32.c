@@ -168,7 +168,6 @@ SHIM(LoadStringA) { RET(0, 4); }
 SHIM(DestroyWindow) { RET(1, 1); }
 SHIM(ShowWindow) { post_activate(); RET(1, 2); }
 SHIM(UpdateWindow) { RET(1, 1); }
-SHIM(MoveWindow) { RET(1, 6); }
 SHIM(SetForegroundWindow) { RET(1, 1); }
 SHIM(GetForegroundWindow) { RET(FAKE_HWND, 0); }
 SHIM(IsIconic) { RET(0, 1); }
@@ -434,7 +433,31 @@ SHIM(ToUnicodeEx) {
     RET(1, 7);
 }
 SHIM(TrackMouseEvent) { RET(1, 1); }
+#if defined(GAME_FC2)
+/* Far Cry 2 sizes its window for the display mode it selected (SetWindowPos
+ * with SWP_NOMOVE|SWP_NOZORDER, or MoveWindow) and then verifies the client
+ * area through GetClientRect. Both used to be no-ops, so the reported client
+ * stayed at the initial window size and the engine re-applied the same mode
+ * forever (see platform_resize_window). Only FC2 is switched over: the other
+ * ports' behaviour here has not been re-tested. */
+SHIM(SetWindowPos) {
+    if (ARG(0) && !(ARG(6) & 0x0001 /* SWP_NOSIZE */)) {
+        int cx = (int)ARG(4), cy = (int)ARG(5);
+        if (cx > 0 && cy > 0) platform_resize_window(cx, cy);
+    }
+    RET(1, 7);
+}
+SHIM(MoveWindow) {
+    int x = (int)ARG(1), y = (int)ARG(2), w = (int)ARG(3), h = (int)ARG(4);
+    (void)x;
+    (void)y;
+    if (w > 0 && h > 0) platform_resize_window(w, h);
+    RET(1, 6);
+}
+#else
 SHIM(SetWindowPos) { RET(1, 7); }
+SHIM(MoveWindow) { RET(1, 6); }
+#endif
 SHIM(SetWindowLongA) { RET(0, 3); }
 /* Far Cry 2 enumerates modes with EnumDisplaySettingsA(name, i, &dm) from
  * i = 0 upwards until the call fails, then picks the one closest to the

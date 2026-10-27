@@ -52,6 +52,37 @@ static uint32_t rd32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | 
 /* Loads a PE image at `want_base` (applying relocations if it differs from
  * the preferred base), resolves its imports and registers its exports.
  * Returns the entry point. */
+static uint32_t g_exe_base;
+
+/* Bind a mapped module's import address table. Split out of load_pe() so
+ * main() can run a second pass once every module has been mapped: Dunia.dll
+ * loads before binkw32.dll but imports it, and a module's exports are only
+ * registered as that module is mapped, so a single pass bound Dunia's Bink
+ * imports to the abort stub ("unimplemented import binkw32!_BinkSetMemory@8"
+ * when the first movie started). rt_import() consults the registered export
+ * table before its own thunk cache, so re-running the pass binds the real
+ * addresses. */
+static void bind_imports(uint32_t base) {
+    uint32_t pe = rd32(MEM + base + 0x3C);
+    const uint8_t *opt = MEM + base + pe + 24;
+    uint32_t imp_rva = rd32(opt + 104);
+    for (uint32_t d = base + imp_rva; imp_rva && M32(d + 12); d += 20) {
+        const char *dll = (const char *)(MEM + base + M32(d + 12));
+        uint32_t ilt = M32(d) ? base + M32(d) : base + M32(d + 16);
+        uint32_t iat = base + M32(d + 16);
+        for (; M32(ilt); ilt += 4, iat += 4) {
+            uint32_t e = M32(ilt);
+            /* MSVC mangles are long; the longest import in Dunia.dll is 140
+             * bytes, so a 128-byte buffer used to cut the name short and
+             * silently bind the import to the abort stub instead of its shim. */
+            char name[1024];
+            if (e & 0x80000000u) snprintf(name, sizeof name, "#%u", e & 0xFFFF);
+            else snprintf(name, sizeof name, "%s", (const char *)(MEM + base + e + 2));
+            M32(iat) = rt_import(dll, name);
+        }
+    }
+}
+
 static uint32_t load_pe(const char *path, uint32_t want_base, const char *modname) {
     FILE *f = NULL;
 #ifdef GAME_SKYRIM
@@ -145,23 +176,7 @@ static uint32_t load_pe(const char *path, uint32_t want_base, const char *modnam
             if (M32(funcs + 4 * i)) rt_register_data(modname, nm, base + M32(funcs + 4 * i));
         }
     }
-    /* imports */
-    uint32_t imp_rva = rd32(opt + 104);
-    for (uint32_t d = base + imp_rva; imp_rva && M32(d + 12); d += 20) {
-        const char *dll = (const char *)(MEM + base + M32(d + 12));
-        uint32_t ilt = M32(d) ? base + M32(d) : base + M32(d + 16);
-        uint32_t iat = base + M32(d + 16);
-        for (; M32(ilt); ilt += 4, iat += 4) {
-            uint32_t e = M32(ilt);
-            /* MSVC mangles are long; the longest import in Dunia.dll is 140
-             * bytes, so a 128-byte buffer used to cut the name short and
-             * silently bind the import to the abort stub instead of its shim. */
-            char name[1024];
-            if (e & 0x80000000u) snprintf(name, sizeof name, "#%u", e & 0xFFFF);
-            else snprintf(name, sizeof name, "%s", (const char *)(MEM + base + e + 2));
-            M32(iat) = rt_import(dll, name);
-        }
-    }
+    bind_imports(base);
     uint32_t tls_rva = rd32(opt + 168), tls_size = rd32(opt + 172);
     free(buf);
     extern void rt_module_add(const char *, uint32_t);
@@ -170,6 +185,7 @@ static uint32_t load_pe(const char *path, uint32_t want_base, const char *modnam
     if (!strcmp(modname, GAME_EXE)) {
         g_entry = entry;
         g_image_size = image_size;
+        g_exe_base = base;
         if (tls_rva && tls_size) {
             extern void rt_set_static_tls(uint32_t, uint32_t, uint32_t, uint32_t);
             uint32_t d = base + tls_rva;
@@ -547,6 +563,14 @@ int main(int argc, char **argv) {
     for (; g_dll_modules[ndll]; ndll++)
         dll_entries[ndll] = load_pe(g_dll_modules[ndll], g_dll_bases[ndll], g_dll_modules[ndll]);
     load_pe(GAME_EXE, 0, GAME_EXE);
+    /* Second import pass. Imports are bound as each module is mapped, so an
+     * import from a module that has not been mapped yet (Dunia.dll imports
+     * binkw32.dll, which loads after it) bound to the abort stub and aborted
+     * the first time a movie played. Every module is present now; re-binding
+     * resolves those to the real exports (rt_import() checks the registered
+     * export table before its thunk cache, so the second pass takes effect). */
+    for (int i = 0; i < ndll; i++) bind_imports(g_dll_bases[i]);
+    bind_imports(g_exe_base);
     extern void touch_setup_guest(void);
     touch_setup_guest();
     for (int i = 0; i < ndll; i++) {

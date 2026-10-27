@@ -509,9 +509,15 @@ static bool jpg_size(const uint8_t *p, uint32_t n, int *w, int *h) {
 
 // ---------------------------------------------------------------- shims
 extern "C" void shim_D3DXGetImageInfoFromFileInMemory(CPU *c) {
-    D3DXIMAGE_INFO *info = (D3DXIMAGE_INFO *)GPTR(ARG(0));
-    const uint8_t *p = (const uint8_t *)GPTR(ARG(1));
-    uint32_t n = ARG(2);
+    /* HRESULT D3DXGetImageInfoFromFileInMemory(LPCVOID pSrcData, UINT SrcDataSize,
+     *                                          D3DXIMAGE_INFO *pImageInfo);
+     * The data pointer/size come first and the output struct last. Reading them
+     * the other way round sent 0x1080 (the image size) in as the source buffer,
+     * i.e. inside the PROT_NONE guard page at the bottom of MEM, and the first
+     * UI texture load took SIGSEGV. */
+    const uint8_t *p = (const uint8_t *)GPTR(ARG(0));
+    uint32_t n = ARG(1);
+    D3DXIMAGE_INFO *info = (D3DXIMAGE_INFO *)GPTR(ARG(2));
     HRESULT hr = D3DERR_INVALIDCALL;
     memset(info, 0, sizeof *info);
     Dds d;

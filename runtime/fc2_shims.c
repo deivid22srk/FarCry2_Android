@@ -1227,7 +1227,8 @@ SHIM(GetSystemPowerStatus) {
 }
 SHIM(SetThreadPriorityBoost) { RET(1, 2); }
 SHIM(SetEnvironmentVariableW) { RET(1, 2); }
-SHIM(GetPrivateProfileStringW) { RET(0, 6); }
+/* GetPrivateProfileStringW lives next to the ANSI version below: it is the
+ * call that supplies the engine language (see the comment there). */
 SHIM(InterlockedExchangeAdd) { RET(__atomic_fetch_add((uint32_t *)GPTR(ARG(0)), ARG(1), __ATOMIC_SEQ_CST), 2); }
 
 /* Named pipes: the engine creates one for its console/remote log. Refuse
@@ -1632,6 +1633,74 @@ SHIM(WritePrivateProfileStringA) {
     rt_host_path(file, host, sizeof host);
     const char *v = GSTR(ARG(2));
     RET(ini_write(host, GSTR(ARG(0)), GSTR(ARG(1)), v ? v : ""), 4);
+}
+
+/* Wide->ANSI for the profile APIs: only the ASCII range is meaningful for
+ * section/key/value names, so fold anything else to '?'. */
+static void w16_to_a(const void *w, char *out, size_t cap) {
+    size_t n = 0;
+    if (!cap) return;
+    if (w) {
+        for (; u16_at(w, n) && n + 1 < cap; n++) {
+            uint16_t ch = u16_at(w, n);
+            out[n] = ch < 0x80 ? (char)ch : '?';
+        }
+    }
+    out[n < cap ? n : cap - 1] = 0;
+}
+
+/* Far Cry 2 obtains its engine language through the *wide* entry point:
+ *
+ *   GetPrivateProfileStringW(L"FC2_INIT", L"language", L"english", buf, 256,
+ *                            <profile dir>\FC2Init.ini)
+ *
+ * (f_10004690, Dunia.dll 0x10004818-0x10004827; the literals are at
+ * 0x10d839bc/0x10d839d0/0x10d839e4/0x10d839f4.) The result becomes
+ * Language+0x34 (magma::Language, built by f_104C0ED0/f_1029B6E0), and that
+ * name is the first component of every localized data path - "ui\localized
+ * \<lang>\...". While this was a stub returning 0 without writing the buffer,
+ * f_1029B6E0 copied the string's *stale* inline bytes as the language name
+ * (one 0x10 byte), so every localized lookup was unmatchable: the UI package
+ * documents never registered and the first page request faulted on the NULL
+ * document. Return the value when the INI is present and lpDefault otherwise,
+ * which is what Windows does - the game's own default is L"english". */
+SHIM(GetPrivateProfileStringW) {
+    static int seen;
+    uint32_t cap = ARG(4), buf = ARG(3);
+    char app[256], key[256], def[512], file[1024];
+    w16_to_a(ARG(0) ? GPTR(ARG(0)) : NULL, app, sizeof app);
+    w16_to_a(ARG(1) ? GPTR(ARG(1)) : NULL, key, sizeof key);
+    w16_to_a(ARG(2) ? GPTR(ARG(2)) : NULL, def, sizeof def);
+    w16_to_a(ARG(5) ? GPTR(ARG(5)) : NULL, file, sizeof file);
+    if (!seen++)
+        LOG("fc2: GetPrivateProfileStringW(app='%s' key='%s' def='%s' file='%s')",
+            app[0] ? app : "(null)", key[0] ? key : "(null)",
+            def[0] ? def : "(null)", file[0] ? file : "(null)");
+    char host[1024], val[512];
+    const char *r = NULL;
+    rt_host_path(file[0] ? file : "port/FC2Init.ini", host, sizeof host);
+    if (ini_get(host, app, key, val, sizeof val)) r = val;
+    if (!r && file[0]) {
+        /* The install keeps FC2Init.ini in bin/, next to the executable; the
+         * engine looks for it under its profile directory, which never holds
+         * it. Fall back to the file the game actually ships. */
+        const char *base = strrchr(file, '\\');
+        base = base ? base + 1 : file;
+        if (*base && g_game_dir[0]) {
+            snprintf(host, sizeof host, "%s/bin/%s", g_game_dir, base);
+            if (ini_get(host, app, key, val, sizeof val)) r = val;
+        }
+    }
+    if (!r) r = def;
+    uint32_t n = (uint32_t)strlen(r);
+    if (buf && cap) {
+        uint16_t *w = (uint16_t *)(MEM + buf);
+        uint32_t c = n < cap - 1 ? n : cap - 1;
+        for (uint32_t i = 0; i < c; i++) u16_put(w, i, (uint8_t)r[i]);
+        u16_put(w, c, 0);
+        n = c;
+    }
+    RET(n, 6);
 }
 
 /* ---- USER32 ---------------------------------------------------------- */

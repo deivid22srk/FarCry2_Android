@@ -125,5 +125,5 @@ void user32_set_screen(int w, int h);
 
 /* ---- platform (runtime/platform_sdl.c) ---- */
 void platform_window_size(int *w, int *h);
-
+void platform_resize_window(int w, int h);
 void rt_init_shims(void);

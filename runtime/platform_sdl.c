@@ -273,4 +273,19 @@ void platform_present_hook(void) {
     }
 }
 void platform_window_size(int *w, int *h) { if (g_window) SDL_GetWindowSize(g_window, w, h); }
+/* user32's SetWindowPos/MoveWindow. Far Cry 2's display-mode switch sizes its
+ * window to the mode it selected and then checks the result through
+ * GetClientRect (which reports this window); with these as no-ops the reported
+ * size never changed, so the engine re-applied the same mode over and over
+ * (1430 IDirect3DDevice9::Reset calls, all 1024x576, before the software
+ * Vulkan driver died). Resizing the real window lets the switch converge. */
+void platform_resize_window(int w, int h) {
+    if (!g_window || w <= 0 || h <= 0) return;
+    int cw = 0, ch = 0;
+    SDL_GetWindowSize(g_window, &cw, &ch);
+    if (cw == w && ch == h) return;
+    SDL_SetWindowSize(g_window, w, h);
+    user32_set_screen(w, h);
+    LOG("platform: window resized to %dx%d", w, h);
+}
 int platform_frame_count(void) { return g_frames; }
