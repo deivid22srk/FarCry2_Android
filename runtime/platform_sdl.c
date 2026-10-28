@@ -29,6 +29,7 @@ void platform_init(void) {
         if (usm_driver_open(g_driver_dir, g_native_lib_dir, &drv, &gipa)) {
             dxvk_vulkan_set_get_instance_proc_addr(gipa);
             SDL_Vulkan_SetExternalLoader(drv, gipa);
+            LOG("platform: DXVK and SDL now resolve Vulkan through the custom GPU driver");
         }
     }
 #endif

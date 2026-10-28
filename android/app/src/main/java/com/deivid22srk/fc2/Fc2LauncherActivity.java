@@ -88,6 +88,7 @@ public class Fc2LauncherActivity extends Activity {
     private TextView folderText, folderStatus, buildStatus, statusLine;
     private View playButton;
     private LinearLayout driverList;           /* the GPU-driver rows, rebuilt on demand */
+    private TextView driverStatus;             /* what the driver was on the last run, from log.txt */
     private FrameLayout homeScreen, settingsScreen;
     private final Map<String, CompoundButton> toggles = new LinkedHashMap<>();
     private final TextView[] logChips = new TextView[3];
@@ -128,6 +129,7 @@ public class Fc2LauncherActivity extends Activity {
     protected void onResume() {
         super.onResume();
         refreshFolder();
+        refreshDriverStatus();
     }
 
     @Override
@@ -513,6 +515,15 @@ public class Fc2LauncherActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT);
         dsubp.topMargin = dp(3);
         drv.addView(dsub, dsubp);
+
+        /* what the game actually used on the last run (parsed from port/log.txt,
+         * where the runtime writes its driver verdict) */
+        driverStatus = tv("", 11, MUTED, regular);
+        driverStatus.setLineSpacing(dp(2), 1f);
+        LinearLayout.LayoutParams dstp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        dstp.topMargin = dp(3);
+        drv.addView(driverStatus, dstp);
 
         driverList = new LinearLayout(this);
         driverList.setOrientation(LinearLayout.VERTICAL);
@@ -911,6 +922,42 @@ public class Fc2LauncherActivity extends Activity {
             divider(driverList);
             driverList.addView(driverRow(n, n, driverChoice().equals(n), true));
         }
+        refreshDriverStatus();
+    }
+
+    /* The runtime writes its driver verdict to port/log.txt ("driver: ACTIVE
+     * ..." or the reason it kept the system driver). Show the last one, so a
+     * selected driver that silently fell back is visible without adb. */
+    private void refreshDriverStatus() {
+        if (driverStatus == null) return;
+        String s = lastDriverStatusLine();
+        if (s == null) {
+            driverStatus.setText("");
+            return;
+        }
+        boolean ok = s.startsWith("ACTIVE") || s.startsWith("system");
+        driverStatus.setText("Última execução: " + s);
+        driverStatus.setTextColor(ok ? GREEN : AMBER);
+    }
+
+    private String lastDriverStatusLine() {
+        String folder = prefs.getString("folder", null);
+        if (folder == null) return null;
+        File log = new File(new File(folder, "port"), "log.txt");
+        if (!log.exists()) return null;
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(log, "r")) {
+            long len = Math.min(raf.length(), 65536);
+            byte[] b = new byte[(int) len];
+            raf.readFully(b);
+            String out = null;
+            for (String ln : new String(b, java.nio.charset.StandardCharsets.UTF_8).split("\n")) {
+                String t = ln.trim();
+                if (t.startsWith("driver:")) out = t.substring(7).trim();
+            }
+            return out;
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private View driverRow(String key, String label, boolean selected, boolean removable) {
@@ -1018,6 +1065,7 @@ public class Fc2LauncherActivity extends Activity {
 
             File lib = err == null ? findVulkanLib(tmp, 3) : null;
             if (err == null && lib == null) err = "o ZIP não tem libvulkan.so";
+            if (err == null && lib != null) err = invalidSoReason(lib);
 
             final String ferr = err;
             final File flib = lib;
@@ -1053,6 +1101,31 @@ public class Fc2LauncherActivity extends Activity {
             File r = findVulkanLib(f, depth - 1);
             if (r != null) return r;
         }
+        return null;
+    }
+
+    /* A driver pack is only usable if its libvulkan.so is a 64-bit
+     * little-endian arm64 ELF; anything else would be rejected at runtime and
+     * the game would run on the system driver with no explanation. */
+    private static String invalidSoReason(File f) {
+        byte[] h = new byte[20];
+        int n = 0;
+        try (java.io.FileInputStream in = new java.io.FileInputStream(f)) {
+            while (n < h.length) {
+                int r = in.read(h, n, h.length - n);
+                if (r < 0) break;
+                n += r;
+            }
+        } catch (Exception e) {
+            return "não foi possível ler " + f.getName();
+        }
+        if (n < h.length || h[0] != 0x7f || h[1] != 'E' || h[2] != 'L' || h[3] != 'F')
+            return f.getName() + " não é uma biblioteca ELF";
+        if (h[4] != 2 || h[5] != 1)
+            return f.getName() + " não é ELF 64-bit little-endian";
+        int machine = (h[18] & 0xff) | ((h[19] & 0xff) << 8);
+        if (machine != 0xB7)
+            return f.getName() + " não é arm64 (aarch64)";
         return null;
     }
 

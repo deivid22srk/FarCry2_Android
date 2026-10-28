@@ -35,6 +35,47 @@
 #include "SDL_androidvulkan.h"
 #include "SDL_syswm.h"
 
+/* Set by SDL_Vulkan_SetExternalLoader: the handle belongs to the caller, so
+ * unloading it here would pull the loader out from under the app. */
+static SDL_bool external_loader = SDL_FALSE;
+
+/* The request is remembered, not just applied: a caller that runs before the
+ * video device exists (SDL_GetVideoDevice() == NULL) must not be dropped
+ * silently -- its loader is wired in at the next Vulkan_LoadLibrary instead. */
+static struct {
+    SDL_bool pending;
+    void *handle;
+    void *gipa;
+} external_request;
+
+static void apply_external_loader(SDL_VideoDevice *_this)
+{
+    PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)external_request.gipa;
+
+    external_request.pending = SDL_FALSE;
+    external_loader = SDL_TRUE;
+    _this->vulkan_config.loader_handle = external_request.handle ? external_request.handle : (void *)-1;
+    _this->vulkan_config.loader_path[0] = '\0';
+    _this->vulkan_config.vkGetInstanceProcAddr = external_request.gipa;
+    _this->vulkan_config.vkEnumerateInstanceExtensionProperties =
+        (void *)gipa(VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties");
+    _this->vulkan_config.loader_loaded = SDL_TRUE;
+}
+
+void SDL_Vulkan_SetExternalLoader(void *handle, void *vkGetInstanceProcAddr)
+{
+    SDL_VideoDevice *_this = SDL_GetVideoDevice();
+
+    external_request.handle = handle;
+    external_request.gipa = vkGetInstanceProcAddr;
+    external_request.pending = (vkGetInstanceProcAddr != NULL);
+
+    if (!_this || !vkGetInstanceProcAddr) {
+        return;
+    }
+    apply_external_loader(_this);
+}
+
 int Android_Vulkan_LoadLibrary(_THIS, const char *path)
 {
     VkExtensionProperties *extensions = NULL;
@@ -42,6 +83,12 @@ int Android_Vulkan_LoadLibrary(_THIS, const char *path)
     SDL_bool hasSurfaceExtension = SDL_FALSE;
     SDL_bool hasAndroidSurfaceExtension = SDL_FALSE;
     PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = NULL;
+    if (external_request.pending) {
+        /* A loader was handed in before the video device existed: apply it
+         * now, don't open a second, stock one. */
+        apply_external_loader(_this);
+        return 0;
+    }
     if (_this->vulkan_config.loader_handle) {
         return SDL_SetError("Vulkan already loaded");
     }
@@ -99,27 +146,6 @@ fail:
     SDL_UnloadObject(_this->vulkan_config.loader_handle);
     _this->vulkan_config.loader_handle = NULL;
     return -1;
-}
-
-/* Set by SDL_Vulkan_SetExternalLoader: the handle belongs to the caller, so
- * unloading it here would pull the loader out from under the app. */
-static SDL_bool external_loader = SDL_FALSE;
-
-void SDL_Vulkan_SetExternalLoader(void *handle, void *vkGetInstanceProcAddr)
-{
-    SDL_VideoDevice *_this = SDL_GetVideoDevice();
-    PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)vkGetInstanceProcAddr;
-
-    if (!_this || !gipa) {
-        return;
-    }
-    external_loader = SDL_TRUE;
-    _this->vulkan_config.loader_handle = handle ? handle : (void *)-1;
-    _this->vulkan_config.loader_path[0] = '\0';
-    _this->vulkan_config.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
-    _this->vulkan_config.vkEnumerateInstanceExtensionProperties =
-        (void *)gipa(VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties");
-    _this->vulkan_config.loader_loaded = SDL_TRUE;
 }
 
 void Android_Vulkan_UnloadLibrary(_THIS)

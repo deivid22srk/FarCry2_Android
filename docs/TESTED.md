@@ -269,3 +269,49 @@ needs its own investigation; nothing was changed here in this round.
 * `ReadFile ... failed` lines if any data read actually fails;
 * `CreateFileA failed ... data_win32` / `FindFirstFileW ... no match` lines
   naming exactly which story-load file is missing, if that is the stall.
+
+## Round 5 (2026-10-28): the adrenotools integration, done properly
+
+The launcher had a GPU-driver import and selection screen, but "what's in the
+app doesn't work" per the user: selecting an imported Turnip pack either did
+nothing visible (game kept running on the Qualcomm driver) or failed somewhere
+invisible. An audit of the whole chain against the official example
+(darksylinc/AdrenoToolsTest) and current upstream bylaws/libadrenotools found
+the vendored library, the hook libraries and the build packaging were all
+correct and current — the APK ships `libmain_hook.so`, `libhook_impl.so`,
+`libfile_redirect_hook.so` and `libgsl_alloc_hook.so`, links adrenotools into
+`libmain.so`, and extracts native libs (`useLegacyPackaging` +
+`extractNativeLibs`) so `nativeLibraryDir` really holds the hooks. What was
+missing was every piece that decides *whether it worked*:
+
+* **No tmpLibDir.** `adrenotools_open_libvulkan` was called with `nullptr`
+  where the official example passes a writable folder; below API 29 memfd may
+  not exist and the port's minSdk is 28. It now gets `<save>/driver-tmp`.
+* **No RTLD_LOCAL** on the loader open (the example uses `RTLD_NOW |
+  RTLD_LOCAL`); harmless but now aligned.
+* **Silent failures.** Every failure inside the hook goes to logcat
+  (`hook_impl` tag), so log.txt only ever said "keeping the system driver"
+  with no reason. `usm_driver_open` now mirrors every decision to logcat
+  (tag `fc2-driver`) and log.txt, and logs `dlerror()` when the open fails.
+* **No verification.** A driver for the wrong architecture, or one whose ICD
+  never comes up, used to be accepted and then produce a black screen or a
+  silent fallback. `usm_driver_open` now (1) checks the user's `libvulkan.so`
+  is really a 64-bit arm64 ELF before opening it, and (2) *probes* the loaded
+  loader with a throwaway `VkInstance`: it enumerates physical devices through
+  the custom loader and only points DXVK and SDL at it when at least one
+  device answers. The verdict is logged as `driver: ACTIVE <device name>
+  (vulkan x.y.z, driver x.y.z)` — the launcher reads exactly this line.
+* **Fragile SDL wiring.** `SDL_Vulkan_SetExternalLoader` dropped the request
+  silently if the video device did not exist yet. It now remembers the
+  request and applies it at the next `Vulkan_LoadLibrary` as well, so the
+  custom loader can never be lost to call order.
+* **No feedback in the launcher.** The DRIVER DE GPU card now shows "Última
+  execução: …" parsed from `port/log.txt` (green for ACTIVE/system, amber for
+  any fallback reason), and the import rejects packs whose `libvulkan.so` is
+  not an arm64 ELF ("não é arm64 (aarch64)" instead of a silent fallback).
+
+What the next phone log should show with a driver selected: `driver: ACTIVE
+...` naming the imported ICD (Turnip on a working pack), then `platform: DXVK
+and SDL now resolve Vulkan through the custom GPU driver`, and DXVK's device
+banner reporting the custom driver instead of `Adreno (TM) 660 / 512.530.0`.
+If the pack is unusable, log.txt now says exactly which step refused it.
