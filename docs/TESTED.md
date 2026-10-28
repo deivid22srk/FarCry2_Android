@@ -315,3 +315,39 @@ What the next phone log should show with a driver selected: `driver: ACTIVE
 and SDL now resolve Vulkan through the custom GPU driver`, and DXVK's device
 banner reporting the custom driver instead of `Adreno (TM) 660 / 512.530.0`.
 If the pack is unusable, log.txt now says exactly which step refused it.
+
+## Round 6 (2026-10-28): driver import hardened and self-diagnosing
+
+User report: "Erro ao importa driver" with a logcat capture. The capture was
+PID-filtered (only the launcher's own process) and the importer logged
+nothing — it validated by Toast and the reason died with the toast. What the
+log did show: the SAF picker opened ~4s after launch and a toast appeared at
++10s, i.e. our own validation rejecting the file, with the cause invisible.
+
+The importer in `Fc2LauncherActivity` was rewritten:
+
+* **MIME filter removed** from the SAF picker (`EXTRA_MIME_TYPES` zips only).
+  Managers that tag downloads `application/octet-stream` made driver files
+  unselectable and there was nothing to diagnose.
+* **One copy, magic-byte sniffing.** The picked file is copied once to cache
+  (exact size, first 8 bytes), then routed by content: `PK` → zip,
+  `7z¼¯'` → "o arquivo é um .7z — o app só aceita .zip", `Rar!` → same for
+  .rar, ELF → import the bare .so, anything else → "formato desconhecido".
+  A truncated/corrupt zip no longer prints a raw `ZipException` dump.
+* **Pack variants accepted.** Any `libvulkan*.so` at any depth (renamed to
+  `libvulkan.so` on install), one nested-zip level unwrapped when the outer
+  pack has no lib, and a last-resort fallback to the biggest arm64 `.so`
+  over 2 MB for packs with odd names. Multi-ABI packs pick the arm64 lib.
+* **ELF reasons** name the actual problem: "é ELF 32-bit — o driver precisa
+  ser arm64-v8a (64-bit)", "não é arm64/aarch64 (é x86-64)", "é muito
+  pequeno (N KB) para ser um driver Vulkan".
+* **Failures are visible without adb.** Every step is logged to logcat (tag
+  `fc2-driver`, same tag the native runtime uses — the user's captures are
+  PID-filtered, so these lines now actually appear) and appended to
+  `Android/data/com.deivid22srk.fc2/files/driver-import.log` (openable from
+  any file manager). A failure also stays written on the DRIVER card ("Falha
+  ao importar: <motivo> / Detalhes: <path>") instead of flashing by.
+* **Post-install verification**: the installed `drivers/<name>/libvulkan.so`
+  must exist before the pack is announced and auto-selected; a concurrent
+  second import is refused ("Uma importação já está em andamento") because
+  both would race in the same cache dir.

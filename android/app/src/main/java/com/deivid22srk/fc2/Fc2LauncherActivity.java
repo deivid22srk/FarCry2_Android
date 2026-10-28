@@ -89,6 +89,9 @@ public class Fc2LauncherActivity extends Activity {
     private View playButton;
     private LinearLayout driverList;           /* the GPU-driver rows, rebuilt on demand */
     private TextView driverStatus;             /* what the driver was on the last run, from log.txt */
+    private java.io.PrintWriter importLog;     /* per-import diagnostics, user-shareable */
+    private String importLogPath;              /* absolute path surfaced in the UI on failure */
+    private boolean importBusy;                /* one import at a time (shared cache dir) */
     private FrameLayout homeScreen, settingsScreen;
     private final Map<String, CompoundButton> toggles = new LinkedHashMap<>();
     private final TextView[] logChips = new TextView[3];
@@ -509,7 +512,8 @@ public class Fc2LauncherActivity extends Activity {
         sectionTitle(drv, "DRIVER DE GPU");
         drv.addView(tv("Vulkan", 15, TEXT, medium));
         TextView dsub = tv("Sistema usa o driver da Qualcomm. Um driver importado (Turnip) é usado "
-                + "no lugar dele — resolve bugs e às vezes destrava o jogo em Adreno. arm64.", 11, MUTED, regular);
+                + "no lugar dele — resolve bugs e às vezes destrava o jogo em Adreno. O pacote deve ser "
+                + "um .zip contendo libvulkan.so (arm64).", 11, MUTED, regular);
         dsub.setLineSpacing(dp(2), 1f);
         LinearLayout.LayoutParams dsubp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -998,11 +1002,13 @@ public class Fc2LauncherActivity extends Activity {
     }
 
     private void importDriver() {
+        /* Sem filtro de MIME: muitos gerenciadores marcam .zip baixado como
+         * application/octet-stream e com o filtro o arquivo ficava inselecionável.
+         * O conteúdo é validado aqui por magia de bytes, não pelo nome/mime. */
+        android.util.Log.i("fc2-driver", "[import] botão IMPORTAR DRIVER tocado, abrindo seletor");
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         i.addCategory(Intent.CATEGORY_OPENABLE);
         i.setType("*/*");
-        i.putExtra(Intent.EXTRA_MIME_TYPES,
-                new String[] { "application/zip", "application/x-zip-compressed" });
         try {
             startActivityForResult(i, REQ_DRIVER);
         } catch (ActivityNotFoundException e) {
@@ -1030,84 +1036,329 @@ public class Fc2LauncherActivity extends Activity {
         return n.length() > 40 ? n.substring(0, 40) : n;
     }
 
-    /* The pack is a zip with libvulkan.so somewhere inside (usually at the top,
-     * sometimes in a folder). Extract out of the UI thread and only then look
-     * for the library, so a broken or huge archive cannot lock the launcher. */
+    /* Driver packs: the only file the runtime needs is libvulkan.so (an arm64
+     * ELF) — libadrenotools points the hooked loader straight at
+     * <driverDir>/libvulkan.so, nothing else in the pack matters. Packs
+     * circulate as zips with the lib at the top or a folder or two deep,
+     * sometimes wrapped in another zip, sometimes named libvulkan.adreno.so,
+     * sometimes next to icd.d/ metadata that is never used. The first version
+     * of this importer rejected most of those variants with a toast that
+     * vanished in 3.5s and left no trace, so "erro ao importar" could not be
+     * diagnosed from a logcat capture at all. This version:
+     *   - copies the picked file once (exact size + magic-byte sniffing, so
+     *     the provider's stream quirks and mime labels stop mattering),
+     *   - tells a .zip from a .7z from a .rar from a bare .so up front and
+     *     says so in plain Portuguese instead of a ZipException dump,
+     *   - extracts, unwraps one nested zip level if needed, picks ANY
+     *     libvulkan*.so (renaming it to libvulkan.so on install), falling back
+     *     to the biggest arm64 .so in the pack when the names are odd,
+     *   - validates the ELF header (64-bit LE aarch64) with a reason, and
+     *   - leaves every decision in logcat under the same "fc2-driver" tag the
+     *     native runtime uses AND in a driver-import.log the user can open
+     *     from the file manager (Android/data/com.deivid22srk.fc2/files/) —
+     *     the failure also stays written on the DRIVER card instead of only
+     *     flashing by in a toast. */
+
+    private void ilog(String msg) {
+        android.util.Log.i("fc2-driver", "[import] " + msg);
+        if (importLog != null) importLog.println(new java.util.Date() + " " + msg);
+    }
+
+    /* App-specific external storage: writable without permissions, visible in
+     * any file manager, survives the activity. */
+    private void openImportLog() {
+        importLog = null;
+        try {
+            File base = getExternalFilesDir(null);
+            File f = new File(base != null ? base : getFilesDir(), "driver-import.log");
+            if (f.length() > 256 * 1024) f.delete();   /* keep it small */
+            importLogPath = f.getAbsolutePath();
+            importLog = new java.io.PrintWriter(new java.io.FileWriter(f, true), true);
+        } catch (Exception e) {
+            importLogPath = null;
+        }
+    }
+
+    private void closeImportLog() {
+        if (importLog != null) {
+            try { importLog.close(); } catch (Exception ignored) {}
+            importLog = null;
+        }
+    }
+
     private void unpackDriver(final Uri uri) {
+        if (importBusy) {
+            Toast.makeText(this, "Uma importação já está em andamento", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        importBusy = true;
+        openImportLog();
         final String label = displayName(uri);
+        ilog("=== importação iniciada: " + label + " (" + uri + ")");
         new Thread(() -> {
-            File tmp = new File(getCacheDir(), "driver-import");
-            deleteRecursive(tmp);
-            tmp.mkdirs();
             String err = null;
-            int files = 0;
-            try (java.io.InputStream in = getContentResolver().openInputStream(uri);
-                 java.util.zip.ZipInputStream z = new java.util.zip.ZipInputStream(in)) {
-                if (z == null || in == null) throw new java.io.IOException("não foi possível abrir o arquivo");
-                byte[] buf = new byte[1 << 16];
-                java.util.zip.ZipEntry e;
-                while ((e = z.getNextEntry()) != null) {
-                    String n = e.getName().replace('\\', '/');
-                    if (n.startsWith("/") || n.contains("..")) continue;
-                    File out = new File(tmp, n);
-                    if (e.isDirectory()) { out.mkdirs(); continue; }
-                    File parent = out.getParentFile();
-                    if (parent != null) parent.mkdirs();
-                    try (java.io.FileOutputStream fo = new java.io.FileOutputStream(out)) {
+            String okMsg = null;
+            try {
+                /* 1. copy the picked file once: exact size and magic bytes, and
+                 * extraction no longer depends on the provider's stream. */
+                File bin = new File(getCacheDir(), "driver-import.bin");
+                long size;
+                byte[] magic = new byte[8];
+                int magicLen = 0;
+                try (java.io.InputStream in = getContentResolver().openInputStream(uri)) {
+                    if (in == null)
+                        throw new java.io.IOException("o Android não deixou abrir o arquivo selecionado"
+                                + " — copie o .zip para a pasta Download e escolha de lá");
+                    try (java.io.FileOutputStream fo = new java.io.FileOutputStream(bin)) {
+                        byte[] buf = new byte[1 << 16];
+                        long total = 0;
                         int r;
-                        while ((r = z.read(buf)) > 0) fo.write(buf, 0, r);
+                        while ((r = in.read(buf)) > 0) {
+                            if (total < magic.length) {
+                                int m = (int) Math.min(r, magic.length - total);
+                                System.arraycopy(buf, 0, magic, (int) total, m);
+                                magicLen += m;
+                            }
+                            fo.write(buf, 0, r);
+                            total += r;
+                        }
+                        size = total;
                     }
-                    files++;
                 }
-            } catch (Exception ex) {
-                err = ex.toString();
+                ilog("arquivo copiado: " + size + " bytes, magic " + hex(magic, magicLen));
+                if (size == 0)
+                    throw new java.io.IOException("o arquivo selecionado está vazio (0 bytes)");
+
+                if (magicLen >= 2 && magic[0] == 'P' && magic[1] == 'K') {
+                    okMsg = importFromZip(bin, label);
+                } else if (magicLen >= 6 && magic[0] == 0x37 && magic[1] == 0x7a
+                        && magic[2] == (byte) 0xbc && magic[3] == (byte) 0xaf
+                        && magic[4] == 0x27 && magic[5] == 0x1c) {
+                    throw new java.io.IOException("o arquivo é um .7z — o app só aceita .zip;"
+                            + " baixe o pacote .zip do driver");
+                } else if (magicLen >= 4 && magic[0] == 'R' && magic[1] == 'a'
+                        && magic[2] == 'r' && magic[3] == '!') {
+                    throw new java.io.IOException("o arquivo é um .rar — o app só aceita .zip;"
+                            + " baixe o pacote .zip do driver");
+                } else if (magicLen >= 4 && magic[0] == 0x7f && magic[1] == 'E'
+                        && magic[2] == 'L' && magic[3] == 'F') {
+                    okMsg = importFromSo(bin, label);
+                } else {
+                    throw new java.io.IOException("formato desconhecido (" + hex(magic, magicLen)
+                            + ") — o driver deve vir como .zip contendo libvulkan.so");
+                }
+            } catch (java.util.zip.ZipException ze) {
+                err = "ZIP inválido ou corrompido: " + ze.getMessage()
+                        + " — baixe o pacote de novo";
+                android.util.Log.e("fc2-driver", "[import] zip inválido", ze);
+                if (importLog != null) ze.printStackTrace(importLog);
+            } catch (SecurityException se) {
+                err = "o Android negou acesso ao arquivo (" + se.getMessage()
+                        + ") — copie o .zip para a pasta Download e escolha de lá";
+                android.util.Log.e("fc2-driver", "[import] acesso negado", se);
+                if (importLog != null) se.printStackTrace(importLog);
+            } catch (Throwable t) {
+                err = t.getMessage() != null ? t.getMessage() : t.toString();
+                android.util.Log.e("fc2-driver", "[import] falhou", t);
+                if (importLog != null) t.printStackTrace(importLog);
+            } finally {
+                importBusy = false;
             }
 
-            File lib = err == null ? findVulkanLib(tmp, 3) : null;
-            if (err == null && lib == null) err = "o ZIP não tem libvulkan.so";
-            if (err == null && lib != null) err = invalidSoReason(lib);
-
             final String ferr = err;
-            final File flib = lib;
-            final int nfiles = files;
+            final String fok = okMsg;
             runOnUiThread(() -> {
-                if (ferr != null) {
-                    Toast.makeText(this, "Importação falhou: " + ferr, Toast.LENGTH_LONG).show();
-                    return;
+                try {
+                    if (ferr != null) {
+                        ilog("=== importação FALHOU: " + ferr);
+                        Toast.makeText(this, "Importação falhou: " + ferr, Toast.LENGTH_LONG).show();
+                        if (driverStatus != null) {
+                            driverStatus.setText("Falha ao importar: " + ferr
+                                    + (importLogPath != null ? "\nDetalhes: " + importLogPath : ""));
+                            driverStatus.setTextColor(AMBER);
+                        }
+                    } else if (fok != null) {
+                        ilog("=== importação OK: " + fok);
+                        refreshDrivers();
+                        if (driverStatus != null) {
+                            driverStatus.setText(fok);
+                            driverStatus.setTextColor(GREEN);
+                        }
+                        Toast.makeText(this, fok, Toast.LENGTH_LONG).show();
+                    }
+                } finally {
+                    closeImportLog();
                 }
-                File src = flib.getParentFile();
-                String name = slug(label);
-                File dst = new File(driversDir(), name);
-                for (int i = 2; dst.exists(); i++) dst = new File(driversDir(), name + "-" + i);
-                if (!src.renameTo(dst) && !copyTree(src, dst)) {
-                    Toast.makeText(this, "Não foi possível gravar em " + dst, Toast.LENGTH_LONG).show();
-                    return;
-                }
-                deleteRecursive(tmp);
-                prefs.edit().putString("driver", dst.getName()).apply();
-                refreshDrivers();
-                Toast.makeText(this, "Driver " + dst.getName() + " importado (" + nfiles
-                        + " arquivos). Vale no próximo JOGAR.", Toast.LENGTH_LONG).show();
             });
-        }).start();
+        }, "driver-import").start();
     }
 
-    private static File findVulkanLib(File dir, int depth) {
-        File[] fs = dir.listFiles();
-        if (fs == null || depth < 0) return null;
-        for (File f : fs) if (f.isFile() && f.getName().equals("libvulkan.so")) return f;
-        for (File f : fs) {
-            if (!f.isDirectory()) continue;
-            File r = findVulkanLib(f, depth - 1);
-            if (r != null) return r;
+    /* Zip path: extract, unwrap nested zips if no lib turns up, pick and
+     * validate the library, install <name>/libvulkan.so, select it. Throws
+     * IOException with a user-facing reason; returns the success message. */
+    private String importFromZip(File zip, String label) throws java.io.IOException {
+        File tmp = new File(getCacheDir(), "driver-import");
+        deleteRecursive(tmp);
+        tmp.mkdirs();
+
+        int files = extractZip(zip, tmp);
+        ilog("zip extraído: " + files + " entradas em " + tmp);
+        if (files == 0)
+            throw new java.io.IOException("o ZIP está vazio (0 arquivos dentro)");
+
+        File lib = pickDriverLib(tmp, true);
+        if (lib == null) {
+            /* packs sometimes ship wrapped in a second zip: unwrap one level */
+            File[] fs = tmp.listFiles();
+            boolean nested = false;
+            if (fs != null) {
+                for (File f : fs) {
+                    if (!f.isFile() || !f.getName().toLowerCase().endsWith(".zip")) continue;
+                    File to = new File(f.getParentFile(), f.getName() + "-x");
+                    try {
+                        int n = extractZip(f, to);
+                        ilog("zip interno extraído: " + f.getName() + " (" + n + " entradas)");
+                        nested = true;
+                    } catch (Exception e) {
+                        ilog("zip interno ignorado (" + f.getName() + "): " + e);
+                    }
+                }
+            }
+            if (nested) lib = pickDriverLib(tmp, true);
         }
-        return null;
+
+        if (lib == null) {
+            /* odd pack naming: any arm64 .so big enough to be a driver */
+            lib = pickDriverLib(tmp, false);
+            if (lib != null) ilog("nenhum libvulkan*.so; usando maior .so arm64 do pacote");
+        }
+
+        if (lib == null) {
+            StringBuilder top = new StringBuilder();
+            File[] fs = tmp.listFiles();
+            if (fs != null) {
+                java.util.Arrays.sort(fs, (a, b) -> a.getName().compareTo(b.getName()));
+                for (int i = 0; i < fs.length && i < 6; i++) {
+                    if (top.length() > 0) top.append(", ");
+                    top.append(fs[i].getName());
+                }
+                if (fs.length > 6) top.append(", ...");
+            }
+            throw new java.io.IOException("o ZIP não tem libvulkan.so (conteúdo: " + top + ")");
+        }
+        ilog("lib escolhida: " + lib.getAbsolutePath() + " (" + lib.length() + " bytes)");
+
+        String bad = elfProblem(lib);
+        if (bad != null) throw new java.io.IOException(bad);
+
+        File src = lib.getParentFile();
+        if (src == null) src = tmp;
+        if (!lib.getName().equals("libvulkan.so")) {
+            /* the hooked loader looks for exactly libvulkan.so: normalize */
+            try (java.io.InputStream in = new java.io.FileInputStream(lib);
+                 java.io.OutputStream out = new java.io.FileOutputStream(new File(src, "libvulkan.so"))) {
+                copy(in, out);
+            }
+            ilog("renomeada para libvulkan.so");
+        }
+        ilog("instalando de " + src);
+
+        String name = slug(label);
+        File dst = new File(driversDir(), name);
+        for (int i = 2; dst.exists(); i++) dst = new File(driversDir(), name + "-" + i);
+        if (!src.renameTo(dst) && !copyTree(src, dst))
+            throw new java.io.IOException("não foi possível gravar em " + dst);
+        deleteRecursive(tmp);
+        new File(getCacheDir(), "driver-import.bin").delete();
+
+        if (!new File(dst, "libvulkan.so").isFile())
+            throw new java.io.IOException("instalação incompleta em " + dst);
+
+        prefs.edit().putString("driver", dst.getName()).apply();
+        return "Driver " + dst.getName() + " importado e selecionado. Vale no próximo JOGAR.";
     }
 
-    /* A driver pack is only usable if its libvulkan.so is a 64-bit
-     * little-endian arm64 ELF; anything else would be rejected at runtime and
-     * the game would run on the system driver with no explanation. */
-    private static String invalidSoReason(File f) {
+    /* The user picked the .so itself (no zip): validate and install it as its
+     * own driver folder. */
+    private String importFromSo(File so, String label) throws java.io.IOException {
+        String bad = elfProblem(so);
+        if (bad != null) throw new java.io.IOException(bad);
+        ilog("arquivo .so direto: " + so.length() + " bytes");
+        String base = label.toLowerCase().endsWith(".so") ? label.substring(0, label.length() - 3) : label;
+        String name = slug(base);
+        File dst = new File(driversDir(), name);
+        for (int i = 2; dst.exists(); i++) dst = new File(driversDir(), name + "-" + i);
+        if (!dst.mkdirs()) throw new java.io.IOException("não foi possível criar " + dst);
+        try (java.io.InputStream in = new java.io.FileInputStream(so);
+             java.io.OutputStream out = new java.io.FileOutputStream(new File(dst, "libvulkan.so"))) {
+            copy(in, out);
+        }
+        new File(getCacheDir(), "driver-import.bin").delete();
+        prefs.edit().putString("driver", dst.getName()).apply();
+        return "Driver " + dst.getName() + " importado e selecionado. Vale no próximo JOGAR.";
+    }
+
+    /* Best lib candidate in the extracted pack. Prefer a libvulkan* name that
+     * passes the ELF check; if the pack names things differently, fall back to
+     * the biggest arm64 .so over 2 MB (Turnip is several MB; libc++-style
+     * helpers stay well under that). */
+    private static File pickDriverLib(File dir, boolean vulkanNamesOnly) {
+        java.util.List<File> sos = new ArrayList<>();
+        collectSos(dir, 4, sos);
+        File named = null;
+        for (File f : sos) {
+            if (!f.getName().startsWith("libvulkan")) continue;
+            if (elfProblem(f) == null) return f;
+            if (named == null) named = f;   /* wrong-arch libvulkan: keep for the error */
+        }
+        if (vulkanNamesOnly) return named != null ? named : null;
+        File big = null;
+        for (File f : sos) {
+            if (f.getName().startsWith("libvulkan") || f.length() < 2 * 1024 * 1024) continue;
+            if (elfProblem(f) != null) continue;
+            if (big == null || f.length() > big.length()) big = f;
+        }
+        return big != null ? big : named;
+    }
+
+    private static void collectSos(File dir, int depth, java.util.List<File> out) {
+        File[] fs = dir.listFiles();
+        if (fs == null || depth < 0) return;
+        for (File f : fs) if (f.isFile() && f.getName().endsWith(".so")) out.add(f);
+        for (File f : fs) if (f.isDirectory()) collectSos(f, depth - 1, out);
+    }
+
+    /* Zip-slip-safe extraction; returns the number of file entries written. */
+    private static int extractZip(File zip, File to) throws java.io.IOException {
+        int n = 0;
+        try (java.util.zip.ZipInputStream z = new java.util.zip.ZipInputStream(
+                new java.io.BufferedInputStream(new java.io.FileInputStream(zip), 1 << 16))) {
+            String canTo = to.getCanonicalPath() + File.separator;
+            byte[] buf = new byte[1 << 16];
+            java.util.zip.ZipEntry e;
+            while ((e = z.getNextEntry()) != null) {
+                String name = e.getName().replace('\\', '/');
+                if (name.startsWith("/") || name.contains("..")) { z.closeEntry(); continue; }
+                File out = new File(to, name);
+                if (!out.getCanonicalPath().startsWith(canTo)) { z.closeEntry(); continue; }
+                if (e.isDirectory()) { out.mkdirs(); z.closeEntry(); continue; }
+                File parent = out.getParentFile();
+                if (parent != null) parent.mkdirs();
+                try (java.io.FileOutputStream fo = new java.io.FileOutputStream(out)) {
+                    int r;
+                    while ((r = z.read(buf)) > 0) fo.write(buf, 0, r);
+                }
+                z.closeEntry();
+                n++;
+            }
+        }
+        return n;
+    }
+
+    /* Null when f is a 64-bit little-endian aarch64 ELF — the only thing the
+     * hooked loader can use — otherwise the reason, in Portuguese, for the
+     * toast and the import log. */
+    private static String elfProblem(File f) {
         byte[] h = new byte[20];
         int n = 0;
         try (java.io.FileInputStream in = new java.io.FileInputStream(f)) {
@@ -1121,12 +1372,41 @@ public class Fc2LauncherActivity extends Activity {
         }
         if (n < h.length || h[0] != 0x7f || h[1] != 'E' || h[2] != 'L' || h[3] != 'F')
             return f.getName() + " não é uma biblioteca ELF";
-        if (h[4] != 2 || h[5] != 1)
-            return f.getName() + " não é ELF 64-bit little-endian";
+        if (h[4] != 2)
+            return f.getName() + " é ELF 32-bit — o driver precisa ser arm64-v8a (64-bit)";
+        if (h[5] != 1)
+            return f.getName() + " é big-endian — o driver precisa ser little-endian";
         int machine = (h[18] & 0xff) | ((h[19] & 0xff) << 8);
         if (machine != 0xB7)
-            return f.getName() + " não é arm64 (aarch64)";
+            return f.getName() + " não é arm64/aarch64 (é " + elfMachineName(machine) + ")";
+        if (f.length() < 100 * 1024)
+            return f.getName() + " é muito pequeno (" + (f.length() / 1024)
+                    + " KB) para ser um driver Vulkan";
         return null;
+    }
+
+    private static String elfMachineName(int m) {
+        switch (m) {
+            case 0x03: return "x86";
+            case 0x3e: return "x86-64";
+            case 0x28: return "arm 32-bit";
+            case 0xb7: return "aarch64";
+            case 0xf3: return "riscv";
+            default: return "arch " + m;
+        }
+    }
+
+    private static String hex(byte[] b, int n) {
+        StringBuilder s = new StringBuilder();
+        for (int i = 0; i < n; i++) s.append(String.format("%02x", b[i]));
+        return s.length() > 0 ? s.toString() : "vazio";
+    }
+
+    private static void copy(java.io.InputStream in, java.io.OutputStream out)
+            throws java.io.IOException {
+        byte[] b = new byte[1 << 16];
+        int n;
+        while ((n = in.read(b)) > 0) out.write(b, 0, n);
     }
 
     private static boolean copyTree(File src, File dst) {
