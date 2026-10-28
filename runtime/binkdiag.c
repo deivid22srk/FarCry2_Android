@@ -185,6 +185,48 @@ static void bink_thumb(void) {
 static struct { uint32_t real; uint32_t calls; } g_bk_BinkRegisterFrameBuffers;
 static struct { uint32_t real; uint32_t calls; } g_bk_BinkDoFrame;
 
+/* One green flash per video start: the engine uploads the plane set it is
+ * about to display before Bink has ever decoded into it, and an all-zero YUV
+ * triple is flat green in the engine's YUV shader. Fill a virgin plane set
+ * with its neutral colour (Y = 16 legal black, U = V = 128 grey) so the
+ * pre-decode upload shows black, like the video fade-in on Windows. The
+ * pointers only materialise at the first BinkDoFrame (the registered block
+ * still reads zero there), so the fill runs from the DoFrame wrapper: for the
+ * set that was NOT just decoded, if its planes are still all-zero, paint them
+ * once. Bink overwrites every block of the set when its keyframe lands there,
+ * and the neutral values are closer to real content than zeros for any delta
+ * that does read the set, so this cannot break the reference chain. */
+static void bink_fill_virgin_set(uint32_t fb, uint32_t decoded) {
+    uint32_t yw = M32(fb + 0x04), yh = M32(fb + 0x08);
+    uint32_t cw = M32(fb + 0x0c), ch = M32(fb + 0x10);
+    if (!yw || !yh || !cw || !ch) return;
+    static uint32_t filled_fb;
+    static uint32_t filled_mask;
+    if (filled_fb != fb) { filled_fb = fb; filled_mask = 0; }
+    for (uint32_t set = 0; set < 2; set++) {
+        uint32_t bit = 1u << set;
+        if (filled_mask & bit) continue;
+        uint32_t virgin = 1;
+        for (uint32_t p = 0; p < 3 && virgin; p++) {
+            uint32_t src = M32(fb + 0x18 + 12 * (set * 4 + p) + 4);
+            if (!src) continue;
+            for (uint32_t k = 0; k < 2048; k++)
+                if (M8(src + k)) { virgin = 0; break; }
+        }
+        if (!virgin) { filled_mask |= bit; continue; }
+        for (uint32_t p = 0; p < 3; p++) {
+            uint32_t src   = M32(fb + 0x18 + 12 * (set * 4 + p) + 4);
+            uint32_t pitch = M32(fb + 0x18 + 12 * (set * 4 + p) + 8);
+            if (!src || !pitch) continue;
+            memset((void *)(uintptr_t)(MEM + src), p ? 0x80 : 0x10,
+                   (size_t)pitch * (p ? ch : yh));
+        }
+        filled_mask |= bit;
+        LOG("bink: virgin plane set %u pre-filled neutral (decoded set %u)", set, decoded);
+    }
+    (void)decoded;
+}
+
 static void shim_bk_BinkRegisterFrameBuffers(CPU *c) {
     uint32_t a[2] = { ARG(0), ARG(1) };
     g_bk_fb = a[1];
@@ -207,9 +249,11 @@ static void shim_bk_BinkDoFrame(CPU *c) {
             g_bk_BinkDoFrame.calls);
     }
     if (probes < 3) { probes++; bink_probe_fb("decoded"); }
-    if (!r) {
+    if (!r && g_bk_fb) {
         static uint32_t frames;
         if ((frames++ % 30) == 0) bink_thumb();
+        uint32_t cur = M32(g_bk_fb + 0x14);
+        if (cur <= 1) bink_fill_virgin_set(g_bk_fb, cur);
     }
     RET(r, 1);
 }

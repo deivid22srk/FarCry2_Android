@@ -617,14 +617,75 @@ extern "C" void pf_stretch(uint32_t src, uint32_t dst) {
 }
 extern "C" void pf_clear(uint32_t color) { g_pf_clears++; g_pf_clear_color = color; }
 extern "C" void pf_settex(uint32_t stage, uint32_t tex) { if (!stage) g_pf_tex0 = tex; }
+
+/* The guest handle of the swap chain's back buffer, remembered from
+ * GetBackBuffer so the summary can say whether the frame's last render target
+ * WAS the back buffer (a final composite quad) or not (the scene stayed
+ * off-screen -- the black-screen shape when the composite goes through the
+ * D3DX blit instead). */
+static uint32_t g_pf_bb;
+extern "C" void pf_bb(uint32_t g) {
+    if (g && g != g_pf_bb) { g_pf_bb = g; LOG("pf: back buffer is %08x", g); }
+}
+
+/* Every 120th frame, read the back buffer back and summarise its pixels:
+ * mean/min/max of a coarse grid. This settles "is the image reaching the
+ * back buffer at all" without a screenshot: an empty buffer (all zeros) means
+ * the composite never happened; a filled buffer that still shows black on the
+ * phone means Present/rects/gamma are the problem. */
+static void pf_bb_probe(IDirect3DDevice9 *d) {
+    static uint32_t n;
+    if (!g_pf_bb || (++n % 120) != 0) return;
+    IDirect3DSurface9 *bb = (IDirect3DSurface9 *)com_host(g_pf_bb);
+    if (!bb) return;
+    D3DSURFACE_DESC desc;
+    if (FAILED(bb->GetDesc(&desc))) return;
+    static IDirect3DSurface9 *stage;
+    static uint32_t sw, sh, sf;
+    if (!stage || sw != desc.Width || sh != desc.Height || sf != desc.Format) {
+        if (stage) { stage->Release(); stage = nullptr; }
+        d->CreateOffscreenPlainSurface(desc.Width, desc.Height, desc.Format,
+                                       D3DPOOL_SYSTEMMEM, &stage, nullptr);
+        sw = desc.Width; sh = desc.Height; sf = desc.Format;
+    }
+    if (!stage) { static int once; if (!once++) LOG("pf: bb probe: no staging surface"); return; }
+    if (FAILED(d->GetRenderTargetData(bb, stage))) return;
+    D3DLOCKED_RECT lr;
+    if (FAILED(stage->LockRect(&lr, nullptr, D3DLOCK_READONLY))) return;
+    if (lr.pBits && lr.Pitch > 0 && (desc.Format == D3DFMT_A8R8G8B8 || desc.Format == D3DFMT_X8R8G8B8)) {
+        uint32_t mn = 255, mx = 0;
+        double sum = 0;
+        int cnt = 0;
+        for (uint32_t y = 0; y < desc.Height; y += desc.Height / 12 + 1) {
+            const uint8_t *row = (const uint8_t *)lr.pBits + (size_t)y * lr.Pitch;
+            for (uint32_t x = 0; x < desc.Width; x += desc.Width / 24 + 1) {
+                const uint8_t *p = row + (size_t)x * 4;
+                uint32_t lum = (p[0] * 29u + p[1] * 150u + p[2] * 77u) >> 8;
+                if (lum < mn) mn = lum;
+                if (lum > mx) mx = lum;
+                sum += lum;
+                cnt++;
+            }
+        }
+        LOG("pf: bb probe %ux%u: mean %.1f min %u max %u (%d samples)",
+            desc.Width, desc.Height, cnt ? sum / cnt : 0.0, mn, mx, cnt);
+    } else {
+        LOG("pf: bb probe: fmt %d not sampled", (int)desc.Format);
+    }
+    stage->UnlockRect();
+}
+
 static void pf_summary(void) {
     static uint32_t n;
     /* every 15th frame, plus any frame that switched render targets or used
      * StretchRect: those are the transitions the black screen lives in */
     if ((++n % 15) == 0 || g_pf_setrt_pc || g_pf_stretch)
-        LOG("pf %u: rt0=%08x rt1=%08x ds=%08x draws=%u stretch=%u [%08x->%08x] clr=%u(%08x) tex0=%08x",
-            n, g_pf_rt[0], g_pf_rt[1], g_pf_ds, (unsigned)g_last_frame_draws,
-            g_pf_stretch, g_pf_st_src, g_pf_st_dst, g_pf_clears, g_pf_clear_color, g_pf_tex0);
+        LOG("pf %u: rt0=%08x%s rt1=%08x ds=%08x draws=%u stretch=%u [%08x->%08x] "
+            "clr=%u(%08x) tex0=%08x bb=%08x",
+            n, g_pf_rt[0], (g_pf_bb && g_pf_rt[0] == g_pf_bb) ? "=bb" : "",
+            g_pf_rt[1], g_pf_ds, (unsigned)g_last_frame_draws,
+            g_pf_stretch, g_pf_st_src, g_pf_st_dst, g_pf_clears, g_pf_clear_color,
+            g_pf_tex0, g_pf_bb);
     g_pf_stretch = 0; g_pf_setrt_pc = 0;
 }
 static void d3d9_frame_begin(void) {
@@ -645,7 +706,28 @@ void B_IDirect3DDevice9_Present(CPU *c) {
     if (g_d3d_trace) fprintf(stderr, "D3D %d Present\n", g_frame);
     if ((g_frame % 60) == 0)
         LOG("present %d: draws=%u", g_frame, (unsigned)g_frame_draws);
+    /* The source/dest rects the game asks Present to map: a degenerate or
+     * off-screen pair is one of the ways a filled back buffer still shows
+     * black. Log the first calls and every change. */
+    {
+        const RECT *ps = (const RECT *)GPTR(ARG(1)), *pd = (const RECT *)GPTR(ARG(2));
+        RECT s = ps ? *ps : RECT{0, 0, 0, 0};
+        RECT dd2 = pd ? *pd : RECT{0, 0, 0, 0};
+        static RECT last_s, last_d;
+        static int logged, have;
+        if (!have || memcmp(&last_s, &s, sizeof(RECT)) || memcmp(&last_d, &dd2, sizeof(RECT))) {
+            if (logged < 10 || (logged % 200) == 0)
+                LOG("present rects #%d: src=(%ld,%ld)-(%ld,%ld) dst=(%ld,%ld)-(%ld,%ld)",
+                    g_frame, s.left, s.top, s.right, s.bottom,
+                    dd2.left, dd2.top, dd2.right, dd2.bottom);
+            logged++;
+            have = 1;
+            last_s = s;
+            last_d = dd2;
+        }
+    }
     pf_summary();
+    pf_bb_probe(d);
 #ifdef GAME_USM
     usm_display::hold_aspect();  /* camera projection at the window's aspect */
 #endif
@@ -1002,6 +1084,18 @@ void B_IDirect3DSurface9_LockRect(CPU *c) {
     const RECT *r = (const RECT *)GPTR(ARG(2));
     D3DSURFACE_DESC desc;
     s->GetDesc(&desc);
+    /* Locks of render targets are rare in a healthy engine (targets are drawn
+     * into, not read) -- except when the engine composites the final image
+     * into a screen surface on the CPU, which is exactly the story-mode blit
+     * under suspicion. Census them so the path shows up in the log. */
+    if (desc.Pool == D3DPOOL_DEFAULT && (desc.Usage & D3DUSAGE_RENDERTARGET)) {
+        static int n;
+        if (n < 12 || (n % 500) == 0)
+            LOG("rt surface lock #%d: %ux%u fmt %d flags %x rect %d caller %08x",
+                n, desc.Width, desc.Height, (int)desc.Format, (unsigned)ARG(3),
+                !!r, M32(c->r[4]));
+        n++;
+    }
     void *bt; uint32_t bsub; HRESULT hr;
     if (bc_surface_target(s, &bt, &bsub) &&
         bc_lock(bt, bsub, desc.Width, desc.Height, r, ARG(3), ARG(1),

@@ -165,14 +165,55 @@ static int block_bytes(D3DFORMAT f) {
 static int bytes_per_pixel(D3DFORMAT f) {
     switch (f) {
     case D3DFMT_A8R8G8B8: case D3DFMT_X8R8G8B8:
-    case D3DFMT_A8B8G8R8: case D3DFMT_X8B8G8R8: return 4;
+    case D3DFMT_A8B8G8R8: case D3DFMT_X8B8G8R8:
+    case D3DFMT_G16R16: case D3DFMT_R32F: case D3DFMT_G16R16F: return 4;
     case D3DFMT_R8G8B8: return 3;
     case D3DFMT_R5G6B5: case D3DFMT_A1R5G5B5:
-    case D3DFMT_A4R4G4B4: case D3DFMT_A8L8: return 2;
+    case D3DFMT_A4R4G4B4: case D3DFMT_A8L8: case D3DFMT_R16F: return 2;
     case D3DFMT_A8: case D3DFMT_L8: return 1;
+    case D3DFMT_A16B16G16R16: case D3DFMT_A16B16G16R16F:
+    case D3DFMT_G32R32F: return 8;
+    case D3DFMT_A32B32G32R32F: return 16;
     default: return 0;
     }
 }
+
+/* Half-float <-> 8-bit helpers. The engine's post-processing chain ends in a
+ * floating-point render target, and the final image reaches the back buffer
+ * through D3DXLoadSurfaceFromSurface, whose source is then one of the F16/F32
+ * formats. Without a decoder for those the copy fails and nothing is ever
+ * presented -- the story-mode black screen has exactly that shape. */
+static inline float half_to_float(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+    uint32_t exp = (h >> 10) & 0x1f, man = h & 0x3ff;
+    uint32_t f;
+    if (!exp) f = sign | (man << 13);                        /* zero / denormal */
+    else if (exp == 31) f = sign | 0x7f800000u | (man << 13);/* inf / nan */
+    else f = sign | ((exp + 112u) << 23) | (man << 13);
+    float out;
+    memcpy(&out, &f, 4);
+    return out;
+}
+
+static inline uint16_t float_to_half(float v) {
+    uint32_t x;
+    memcpy(&x, &v, 4);
+    uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t e = (int32_t)((x >> 23) & 0xff) - 127 + 15;
+    uint32_t m = x & 0x7fffffu;
+    if (e <= 0) return (uint16_t)sign;
+    if (e >= 31) return (uint16_t)(sign | 0x7c00u);
+    return (uint16_t)(sign | ((uint32_t)e << 10) | (m >> 13));
+}
+
+static inline uint8_t f32_to_u8(float v) {
+    if (!(v == v)) return 0;                    /* NaN */
+    if (v <= 0) return 0;
+    if (v >= 1) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+static inline uint8_t u16_to_u8(uint16_t v) { return (uint8_t)(v >> 8); }
 
 static D3DFORMAT fmt_from_dds(const uint8_t *pf) {
     uint32_t flags = rd32(pf + 4), fourcc = rd32(pf + 8);
@@ -332,6 +373,48 @@ static bool decode_raw(const uint8_t *src, int w, int h, int pitch, D3DFORMAT f,
             case D3DFMT_A8: v = pack_argb(p[0], 0, 0, 0); break;
             case D3DFMT_L8: v = pack_argb(0xFF, p[0], p[0], p[0]); break;
             case D3DFMT_A8L8: v = pack_argb(p[1], p[0], p[0], p[0]); break;
+            case D3DFMT_G16R16:
+                v = pack_argb(0xFF, u16_to_u8(rd16(p + 2)), u16_to_u8(rd16(p)), 0);
+                break;
+            case D3DFMT_A16B16G16R16:
+                v = pack_argb(u16_to_u8(rd16(p + 6)), u16_to_u8(rd16(p + 4)),
+                              u16_to_u8(rd16(p + 2)), u16_to_u8(rd16(p)));
+                break;
+            case D3DFMT_R16F:
+                v = pack_argb(0xFF, f32_to_u8(half_to_float(rd16(p))), 0, 0);
+                break;
+            case D3DFMT_G16R16F:
+                v = pack_argb(0xFF, f32_to_u8(half_to_float(rd16(p + 2))),
+                              f32_to_u8(half_to_float(rd16(p))), 0);
+                break;
+            case D3DFMT_A16B16G16R16F:
+                v = pack_argb(f32_to_u8(half_to_float(rd16(p + 6))),
+                              f32_to_u8(half_to_float(rd16(p + 4))),
+                              f32_to_u8(half_to_float(rd16(p + 2))),
+                              f32_to_u8(half_to_float(rd16(p))));
+                break;
+            case D3DFMT_R32F: {
+                float f;
+                memcpy(&f, p, 4);
+                v = pack_argb(0xFF, f32_to_u8(f), 0, 0);
+                break;
+            }
+            case D3DFMT_G32R32F: {
+                float r, g;
+                memcpy(&r, p, 4);
+                memcpy(&g, p + 4, 4);
+                v = pack_argb(0xFF, f32_to_u8(r), f32_to_u8(g), 0);
+                break;
+            }
+            case D3DFMT_A32B32G32R32F: {
+                float b, g, r, a;
+                memcpy(&b, p, 4);
+                memcpy(&g, p + 4, 4);
+                memcpy(&r, p + 8, 4);
+                memcpy(&a, p + 12, 4);
+                v = pack_argb(f32_to_u8(a), f32_to_u8(r), f32_to_u8(g), f32_to_u8(b));
+                break;
+            }
             default: return false;
             }
             out[y * w + x] = v;
@@ -359,6 +442,48 @@ static void write_argb(uint8_t *dst, int pitch, int w, int h, const uint32_t *sr
             case D3DFMT_A8: p[0] = (uint8_t)a; break;
             case D3DFMT_L8: p[0] = (uint8_t)((r * 77 + g * 150 + b * 29) >> 8); break;
             case D3DFMT_A8L8: p[0] = (uint8_t)((r * 77 + g * 150 + b * 29) >> 8); p[1] = (uint8_t)a; break;
+            case D3DFMT_G16R16: {
+                uint16_t q[2] = { (uint16_t)(r << 8), (uint16_t)(g << 8) };
+                memcpy(p, q, 4);
+                break;
+            }
+            case D3DFMT_A16B16G16R16: {
+                uint16_t q[4] = { (uint16_t)(b << 8), (uint16_t)(g << 8),
+                                  (uint16_t)(r << 8), (uint16_t)(a << 8) };
+                memcpy(p, q, 8);
+                break;
+            }
+            case D3DFMT_R16F: {
+                uint16_t q = float_to_half(r / 255.0f);
+                memcpy(p, &q, 2);
+                break;
+            }
+            case D3DFMT_G16R16F: {
+                uint16_t q[2] = { float_to_half(r / 255.0f), float_to_half(g / 255.0f) };
+                memcpy(p, q, 4);
+                break;
+            }
+            case D3DFMT_A16B16G16R16F: {
+                uint16_t q[4] = { float_to_half(b / 255.0f), float_to_half(g / 255.0f),
+                                  float_to_half(r / 255.0f), float_to_half(a / 255.0f) };
+                memcpy(p, q, 8);
+                break;
+            }
+            case D3DFMT_R32F: {
+                float q = r / 255.0f;
+                memcpy(p, &q, 4);
+                break;
+            }
+            case D3DFMT_G32R32F: {
+                float q[2] = { r / 255.0f, g / 255.0f };
+                memcpy(p, q, 8);
+                break;
+            }
+            case D3DFMT_A32B32G32R32F: {
+                float q[4] = { b / 255.0f, g / 255.0f, r / 255.0f, a / 255.0f };
+                memcpy(p, q, 16);
+                break;
+            }
             default: break;
             }
         }
@@ -767,6 +892,18 @@ extern "C" void shim_D3DXLoadSurfaceFromMemory(CPU *c) {
     RET(S_OK, 10);
 }
 
+/* Dunia's own blit helper (0x10414e50 in the shipped DLL) tries
+ * StretchRect first and only falls back to this D3DX call when it passed
+ * rects, which it does for every final composite -- so the whole frame reaches
+ * the back buffer through here and the function is load-bearing: a silent
+ * failure is the story-mode black screen. Log every call (rate-limited), and
+ * never fail silently: when the source is a render target that cannot be
+ * locked (D3D9 forbids locking D3DPOOL_DEFAULT targets; Windows fails the same
+ * way), do what real D3DX does underneath and move the pixels on the GPU --
+ * StretchRect when the formats allow it, else GetRenderTargetData into a
+ * system-memory copy and decode from there. */
+static int g_lsfs_logs;
+
 extern "C" void shim_D3DXLoadSurfaceFromSurface(CPU *c) {
     IDirect3DSurface9 *dst = (IDirect3DSurface9 *)com_host(ARG(0));
     const RECT *dstRect = (const RECT *)GPTR(ARG(2));
@@ -776,23 +913,76 @@ extern "C" void shim_D3DXLoadSurfaceFromSurface(CPU *c) {
     D3DSURFACE_DESC sd, dd;
     src->GetDesc(&sd);
     dst->GetDesc(&dd);
+    bool verbose = g_lsfs_logs < 16 || (g_lsfs_logs % 300) == 0;
+    if (verbose)
+        LOG("D3DXLoadSurfaceFromSurface #%d: %ux%u fmt %d pool %u usage %x -> "
+            "%ux%u fmt %d pool %u usage %x, rects %d/%d",
+            g_lsfs_logs, sd.Width, sd.Height, (int)sd.Format, (unsigned)sd.Pool,
+            (unsigned)sd.Usage, dd.Width, dd.Height, (int)dd.Format,
+            (unsigned)dd.Pool, (unsigned)dd.Usage, !!srcRect, !!dstRect);
+    g_lsfs_logs++;
     int w = srcRect ? (int)(srcRect->right - srcRect->left) : (int)sd.Width;
     int h = srcRect ? (int)(srcRect->bottom - srcRect->top) : (int)sd.Height;
+    if (w <= 0 || h <= 0) { LOG("D3DXLoadSurfaceFromSurface: empty rect"); RET(D3DERR_INVALIDCALL, 8); }
     std::vector<uint32_t> px((size_t)w * h);
     D3DLOCKED_RECT lr;
     RECT sr = srcRect ? *srcRect : RECT{0, 0, (LONG)sd.Width, (LONG)sd.Height};
-    if (FAILED(src->LockRect(&lr, &sr, D3DLOCK_READONLY))) RET(D3DERR_INVALIDCALL, 8);
-    const uint8_t *base = (const uint8_t *)lr.pBits;
-    if (is_compressed(sd.Format)) {
-        decode_bc(base, w, h, lr.Pitch, sd.Format, px.data(), w);
-    } else if (!decode_raw(base, w, h, lr.Pitch, sd.Format, px.data())) {
+    HRESULT lhr = src->LockRect(&lr, &sr, D3DLOCK_READONLY);
+    if (SUCCEEDED(lhr)) {
+        const uint8_t *base = (const uint8_t *)lr.pBits;
+        if (is_compressed(sd.Format)) {
+            decode_bc(base, w, h, lr.Pitch, sd.Format, px.data(), w);
+        } else if (!decode_raw(base, w, h, lr.Pitch, sd.Format, px.data())) {
+            src->UnlockRect();
+            LOG("D3DXLoadSurfaceFromSurface: unsupported source format %d", (int)sd.Format);
+            RET(E_NOTIMPL, 8);
+        }
         src->UnlockRect();
-        LOG("D3DXLoadSurfaceFromSurface: unsupported source format %d", (int)sd.Format);
-        RET(E_NOTIMPL, 8);
+        blit_argb(dst, dstRect, px.data(), w, h, dd.Format);
+        RET(S_OK, 8);
     }
-    src->UnlockRect();
-    blit_argb(dst, dstRect, px.data(), w, h, dd.Format);
-    RET(S_OK, 8);
+
+    /* The source will not hand out CPU memory. A D3DPOOL_DEFAULT render target
+     * (the post-processing chain's output) is the case that matters; try the
+     * GPU first, exactly the ordering real D3DX uses internally. */
+    bool src_is_rt = sd.Pool == D3DPOOL_DEFAULT && (sd.Usage & D3DUSAGE_RENDERTARGET);
+    LOG("D3DXLoadSurfaceFromSurface: src lock failed (fmt %d pool %u hr %08x, rt=%d)",
+        (int)sd.Format, (unsigned)sd.Pool, (unsigned)lhr, (int)src_is_rt);
+    if (!src_is_rt) RET(lhr, 8);
+    IDirect3DDevice9 *dev = nullptr;
+    if (FAILED(src->GetDevice(&dev)) || !dev) RET(lhr, 8);
+    RECT dr = dstRect ? *dstRect : RECT{0, 0, (LONG)dd.Width, (LONG)dd.Height};
+    HRESULT ghr = dev->StretchRect(src, &sr, dst, &dr, D3DTEXF_LINEAR);
+    if (SUCCEEDED(ghr)) {
+        LOG("D3DXLoadSurfaceFromSurface: carried by StretchRect");
+        dev->Release();
+        RET(S_OK, 8);
+    }
+    /* Formats StretchRect refuses (float targets included): copy through a
+     * system-memory staging surface and finish on the CPU. */
+    IDirect3DSurface9 *stage = nullptr;
+    HRESULT chr = dev->CreateOffscreenPlainSurface(sd.Width, sd.Height, sd.Format,
+                                                   D3DPOOL_SYSTEMMEM, &stage, nullptr);
+    if (SUCCEEDED(chr)) chr = dev->GetRenderTargetData(src, stage);
+    if (SUCCEEDED(chr)) {
+        D3DLOCKED_RECT l2;
+        chr = stage->LockRect(&l2, &sr, D3DLOCK_READONLY);
+        if (SUCCEEDED(chr)) {
+            if (!decode_raw((const uint8_t *)l2.pBits, w, h, l2.Pitch, sd.Format, px.data())) {
+                LOG("D3DXLoadSurfaceFromSurface: unsupported staged source format %d", (int)sd.Format);
+                chr = E_NOTIMPL;
+            } else {
+                blit_argb(dst, dstRect, px.data(), w, h, dd.Format);
+            }
+            stage->UnlockRect();
+        }
+    } else {
+        LOG("D3DXLoadSurfaceFromSurface: staging failed (%08x); stretch was %08x",
+            (unsigned)chr, (unsigned)ghr);
+    }
+    if (stage) stage->Release();
+    dev->Release();
+    RET(SUCCEEDED(chr) ? S_OK : chr, 8);
 }
 
 /* Mip chain filter for 2-D textures: box-average 2x2 (or 4x4 for larger

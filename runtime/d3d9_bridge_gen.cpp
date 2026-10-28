@@ -7,6 +7,7 @@ extern "C" void pf_setds(uint32_t);
 extern "C" void pf_stretch(uint32_t, uint32_t);
 extern "C" void pf_clear(uint32_t);
 extern "C" void pf_settex(uint32_t, uint32_t);
+extern "C" void pf_bb(uint32_t);
 
 static void B_IDirect3D9_QueryInterface(CPU *c) { com_QueryInterface(c); }
 static void B_IDirect3D9_AddRef(CPU *c) { com_AddRef(c); }
@@ -150,6 +151,11 @@ static void B_IDirect3DDevice9_GetBackBuffer(CPU *c) {
     IDirect3DSurface9 *out3 = nullptr;
     auto r = bridge_call(self, &IDirect3DDevice9::GetBackBuffer, ARG(1), ARG(2), ARG(3), &out3);
     if (ARG(4)) M32(ARG(4)) = d3d9_wrap(out3, IFACE_IDirect3DSurface9);
+    if (ARG(4)) pf_bb(M32(ARG(4)));
+    static int n;
+    if (SUCCEEDED(r) && (n < 4 || (n % 200) == 0))
+        LOG("GetBackBuffer(%u,%u) -> %08x", ARG(1), ARG(2), ARG(4) ? M32(ARG(4)) : 0);
+    n++;
     RET((uint32_t)r, 5);
 }
 
@@ -170,6 +176,23 @@ static void B_IDirect3DDevice9_SetDialogBoxMode(CPU *c) {
 static void B_IDirect3DDevice9_SetGammaRamp(CPU *c) {
     IDirect3DDevice9 *self = (IDirect3DDevice9 *)com_host(ARG(0));
     if (g_d3d_trace) d3d_trace(c, "IDirect3DDevice9::SetGammaRamp", 3);
+    /* A ramp that maps everything to black is one of the ways a correctly
+     * rendered frame shows as a black screen; log the first ramps and any
+     * non-identity one so the story-mode fade can be told apart from that. */
+    {
+        D3DGAMMARAMP *rp = (D3DGAMMARAMP *)GPTR(ARG(3));
+        if (rp) {
+            static int n;
+            bool identity = true;
+            for (int i = 0; i < 256; i++)
+                if (rp->red[i] != (i << 8) || rp->green[i] != (i << 8) || rp->blue[i] != (i << 8)) { identity = false; break; }
+            if (!identity || n < 4)
+                LOG("SetGammaRamp #%d scale %u: red[%u]=%u red[128]=%u red[255]=%u%s",
+                    n, ARG(2), 0u, (unsigned)rp->red[0], (unsigned)rp->red[128],
+                    (unsigned)rp->red[255], identity ? " (identity)" : "");
+            n++;
+        }
+    }
     bridge_call(self, &IDirect3DDevice9::SetGammaRamp, ARG(1), ARG(2), GPTR(ARG(3)));
     RET(0, 4);
 }
@@ -230,6 +253,21 @@ static void B_IDirect3DDevice9_GetRenderTargetData(CPU *c) {
     IDirect3DDevice9 *self = (IDirect3DDevice9 *)com_host(ARG(0));
     if (g_d3d_trace) d3d_trace(c, "IDirect3DDevice9::GetRenderTargetData", 2);
     auto r = bridge_call(self, &IDirect3DDevice9::GetRenderTargetData, (IDirect3DSurface9 *)com_host(ARG(1)), (IDirect3DSurface9 *)com_host(ARG(2)));
+    /* Invisible in every other summary line, and one of the three carriers of
+     * the final composite; log the first calls and every failure with the
+     * surface descriptions. */
+    static int n;
+    if (n < 8 || FAILED(r) || (n % 500) == 0) {
+        D3DSURFACE_DESC sd = {}, dd = {};
+        auto *s = (IDirect3DSurface9 *)com_host(ARG(1));
+        auto *d2 = (IDirect3DSurface9 *)com_host(ARG(2));
+        if (s) s->GetDesc(&sd);
+        if (d2) d2->GetDesc(&dd);
+        LOG("GetRenderTargetData #%d: %ux%u fmt %d pool %u -> %ux%u fmt %d pool %u: %08x",
+            n, sd.Width, sd.Height, (int)sd.Format, (unsigned)sd.Pool,
+            dd.Width, dd.Height, (int)dd.Format, (unsigned)dd.Pool, (unsigned)r);
+    }
+    n++;
     RET((uint32_t)r, 3);
 }
 
@@ -887,6 +925,7 @@ static void B_IDirect3DSwapChain9_GetBackBuffer(CPU *c) {
     IDirect3DSurface9 *out2 = nullptr;
     auto r = bridge_call(self, &IDirect3DSwapChain9::GetBackBuffer, ARG(1), ARG(2), &out2);
     if (ARG(3)) M32(ARG(3)) = d3d9_wrap(out2, IFACE_IDirect3DSurface9);
+    if (ARG(3)) pf_bb(M32(ARG(3)));
     RET((uint32_t)r, 4);
 }
 
